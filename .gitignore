@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environements virtuels
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Tests / cache
+.pytest_cache/
+.coverage
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+#Configuration locale
+config_local.py
+
+# Logs
+*.log
+
+# Fichiers temporaires
+*.tmp
+
+# Programmes locaux
+programs/*.json

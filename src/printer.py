@@ -1,17 +1,93 @@
-import serial
-import time
+"""Communication série avec l'imprimante (firmware Marlin)."""
+
 import threading
+import time
+
+import config
+import gcode
+
+
+class PrinterError(Exception):
+    """Erreur renvoyée par l'imprimante ou refus de sécurité."""
+
+
+def list_ports():
+    """Liste les ports série disponibles (ex. ["COM3", "COM11"])."""
+
+    try:
+        from serial.tools import list_ports as lp
+    except ImportError:
+        return []
+
+    return sorted(p.device for p in lp.comports())
+
+
+def open_serial(port, baudrate):
+    """Ouvre un port série sans provoquer de reset de la carte."""
+
+    import serial
+
+    ser = serial.Serial(
+        port=None,
+        baudrate=baudrate,
+        timeout=1,
+        dsrdtr=False,
+        rtscts=False
+    )
+
+    # Évite les changements automatiques des lignes
+    # de contrôle pouvant provoquer un reset.
+    ser.dtr = False
+    ser.rts = False
+
+    ser.port = port
+    ser.open()
+
+    return ser
+
 
 class Printer:
 
-    def __init__(self, port, baudrate=115200):
+    def __init__(
+        self,
+        port,
+        baudrate=115200,
+        serial_factory=None,
+        startup_delay=None,
+        limits=None
+    ):
 
         self.port_name = port
         self.baudrate = baudrate
         self.serial = None
 
-        # Une seule commande à la fois.
+        # Fabrique du port série, conservée injectable pour l’architecture interne.
+        self.serial_factory = serial_factory or open_serial
+
+        self.startup_delay = (
+            config.STARTUP_DELAY
+            if startup_delay is None
+            else startup_delay
+        )
+
+        self.limits = limits if limits is not None else config.AXIS_LIMITS
+
+        # Dernière position connue {"X":.., "Y":.., "Z":..} ou None.
+        self.last_position = None
+        self.homed = False
+
+        # Appelé avec ("TX" | "RX", texte) pour chaque ligne échangée.
+        # Attention : appelé depuis le thread qui envoie la commande.
+        self.on_traffic = None
+
+        # Une seule commande bloquante à la fois.
         self.command_lock = threading.Lock()
+        # Le jog est volontairement hors de command_lock : M410 doit pouvoir
+        # interrompre immédiatement un mouvement en cours.
+        self.jog_lock = threading.Lock()
+
+        # Interrompt l'attente d'une réponse (arrêt, déconnexion).
+        self._abort = threading.Event()
 
     # -------------------------------------------------
     # Connexion
@@ -19,49 +95,42 @@ class Printer:
 
     def connect(self):
 
-        if self.serial and self.serial.is_open:
+        if self.is_connected():
             return
 
-        self.serial = serial.Serial(
-            port=None,
-            baudrate=self.baudrate,
-            timeout=1,
-            dsrdtr=False,
-            rtscts=False
+        self._abort.clear()
+
+        self.serial = self.serial_factory(
+            self.port_name,
+            self.baudrate
         )
 
-        # Évite les changements automatiques des lignes
-        # de contrôle pouvant provoquer un reset.
-        self.serial.dtr = False
-        self.serial.rts = False
-
-        self.serial.port = self.port_name
-        self.serial.open()
+        self.last_position = None
+        self.homed = False
 
         # Laisser Marlin démarrer
-        time.sleep(3)
+        time.sleep(self.startup_delay)
 
         # Vider les messages présents
         self.read_available()
 
-    # -------------------------------------------------
-    # Déconnexion
-    # -------------------------------------------------
-
     def disconnect(self):
+
+        # Libère une éventuelle commande en attente de réponse.
+        self._abort.set()
 
         with self.command_lock:
 
             if self.serial:
 
-                if self.serial.is_open:
-                    self.serial.close()
+                try:
+                    if self.serial.is_open:
+                        self.serial.close()
+                finally:
+                    self.serial = None
 
-                self.serial = None
-
-    # -------------------------------------------------
-    # État
-    # -------------------------------------------------
+        self.last_position = None
+        self.homed = False
 
     def is_connected(self):
 
@@ -71,8 +140,18 @@ class Printer:
         )
 
     # -------------------------------------------------
-    # Lecture des données disponibles
+    # Lecture / écriture bas niveau
     # -------------------------------------------------
+
+    def _emit(self, direction, text):
+
+        callback = self.on_traffic
+
+        if callback:
+            try:
+                callback(direction, text)
+            except Exception:
+                pass
 
     def read_available(self):
 
@@ -90,129 +169,357 @@ class Printer:
 
             if line:
                 messages.append(line)
+                self._emit("RX", line)
 
         return messages
+
+    def _write_raw(self, command):
+        """Écrit une commande sans attendre ni prendre le verrou."""
+
+        if not self.is_connected():
+            raise PrinterError("Imprimante non connectée.")
+
+        self.serial.write((command + "\n").encode("ascii"))
+        self.serial.flush()
+        self._emit("TX", command)
 
     # -------------------------------------------------
     # Envoi d'une commande
     # -------------------------------------------------
 
-    def send_command(self, command, timeout=30):
+    def send_command(self, command, timeout=None):
+        """Envoie une commande et attend le `ok` de Marlin.
+
+        Retourne la liste des lignes reçues (ok compris).
+        """
 
         with self.command_lock:
 
-            return self._send_command_locked(
-                command,
-                timeout
-            )
+            self._abort.clear()
 
-    # -------------------------------------------------
-    # Envoi interne
-    # -------------------------------------------------
+            return self._send_command_locked(command, timeout)
 
-    def _send_command_locked(self, command, timeout=30):
+    def _send_command_locked(self, command, timeout=None):
+
+        if timeout is None:
+            timeout = config.COMMAND_TIMEOUT
 
         if not self.is_connected():
-            raise RuntimeError(
-                "Imprimante non connectée."
-            )
+            raise PrinterError("Imprimante non connectée.")
 
         command = command.strip()
 
         if not command:
             return []
 
-        self.serial.write(
-            (command + "\n").encode("ascii")
-        )
+        try:
+            payload = (command + "\n").encode("ascii")
+        except UnicodeEncodeError:
+            raise PrinterError(
+                "Le G-code ne doit contenir que des caractères ASCII."
+            )
 
+        # Élimine d'éventuelles réponses tardives d'une commande
+        # précédente (timeout, arrêt) pour ne pas se désynchroniser.
+        self.serial.reset_input_buffer()
+
+        self.serial.write(payload)
         self.serial.flush()
+        self._emit("TX", command)
 
         responses = []
+        error = None
 
-        start = time.time()
+        deadline = time.monotonic() + timeout
 
-        while time.time() - start < timeout:
+        while time.monotonic() < deadline:
 
-            if self.serial.in_waiting:
+            if self._abort.is_set():
+                raise PrinterError("Commande interrompue.")
 
-                line = self.serial.readline().decode(
-                    "utf-8",
-                    errors="replace"
-                ).strip()
+            raw = self.serial.readline()
 
-                if not line:
-                    continue
+            if not raw:
+                continue
 
-                responses.append(line)
+            if self._abort.is_set():
+                raise PrinterError("Commande interrompue.")
 
-                # Marlin peut envoyer :
-                #
-                # busy: processing
-                #
-                # avant le OK.
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
 
-                if line.lower() == "ok":
-                    return responses
+            responses.append(line)
+            self._emit("RX", line)
 
-            else:
+            parsed = gcode.parse_position(line)
+            if parsed:
+                self.last_position = parsed
 
-                time.sleep(0.01)
+            lowered = line.lower()
+            if lowered == "ok" or lowered.startswith("ok "):
+                if error:
+                    raise PrinterError(error)
+                return responses
+
+            if lowered.startswith("error:"):
+                error = line
+                if "halted" in lowered or "kill()" in lowered:
+                    raise PrinterError(line)
+
+            elif "busy" in lowered:
+                deadline = time.monotonic() + timeout
+
+        if error:
+            raise PrinterError(error)
 
         raise TimeoutError(
             f"Aucun 'ok' reçu pour la commande : {command}"
         )
 
     # -------------------------------------------------
-    # HOME
+    # Jog continu
     # -------------------------------------------------
 
-    def home(self):
+    def jog_start(self):
+        with self.jog_lock:
+            self._write_raw("G91")
 
-        return self.send_command(
-            "G28",
-            timeout=60
-        )
+    def jog_move(self, axis, distance, speed=None):
+        """Lance un seul mouvement continu ; M410 l'interrompt au relâchement."""
+        axis = axis.upper()
+        if axis not in gcode.AXES:
+            raise PrinterError(f"Axe invalide : {axis!r}")
+        self._check_speed(speed)
+        with self.jog_lock:
+            self._write_raw(f"G1 {axis}{distance:g} F{gcode._speed(speed):g}")
+
+    def _send_raw_and_wait_ok(self, command, timeout=2.0):
+        """Envoie une commande hors command_lock et attend son ``ok``."""
+        if not self.is_connected():
+            raise PrinterError("Imprimante non connectée.")
+        self._write_raw(command)
+        deadline = time.monotonic() + timeout
+        position = None
+        while time.monotonic() < deadline:
+            raw = self.serial.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            self._emit("RX", line)
+            parsed = gcode.parse_position(line)
+            if parsed:
+                position = parsed
+                self.last_position = parsed
+            lowered = line.lower()
+            if lowered == "ok" or lowered.startswith("ok "):
+                return position
+            if lowered.startswith("error:"):
+                raise PrinterError(line)
+        raise TimeoutError(f"Aucun 'ok' reçu pour la commande : {command}")
+
+    def _send_m114_and_wait(self, timeout=3.0):
+        """Envoie un seul M114 et attend réellement la position et le ok."""
+        if not self.is_connected():
+            raise PrinterError("Imprimante non connectée.")
+        self.serial.reset_input_buffer()
+        self._write_raw(gcode.get_position())
+        deadline = time.monotonic() + timeout
+        position = None
+        got_ok = False
+        while time.monotonic() < deadline:
+            raw = self.serial.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            self._emit("RX", line)
+            parsed = gcode.parse_position(line)
+            if parsed:
+                position = parsed
+                self.last_position = parsed
+            lowered = line.lower()
+            if lowered == "ok" or lowered.startswith("ok "):
+                got_ok = True
+                if position is not None:
+                    return position
+            elif lowered.startswith("error:"):
+                raise PrinterError(line)
+        if position is not None:
+            return position
+        if got_ok:
+            raise PrinterError("M114 a répondu ok sans fournir la position.")
+        raise TimeoutError("Aucune position reçue pour M114.")
+
+    def jog_stop(self):
+        """Arrête le jog, repasse en absolu, puis lit UNE fois la position."""
+        with self.jog_lock:
+            if not self.is_connected():
+                return None
+            self._abort.set()
+            try:
+                # M410 doit être confirmé avant d'interroger M114 : sinon le
+                # firmware peut encore être occupé et ignorer/reporter plus
+                # tard la réponse à M114.
+                self._send_raw_and_wait_ok(gcode.quick_stop(), timeout=5.0)
+                self._send_raw_and_wait_ok("G90", timeout=2.0)
+                self._abort.clear()
+                return self._send_m114_and_wait(timeout=3.0)
+            except Exception:
+                self._abort.clear()
+                return self.last_position
+
+    # -------------------------------------------------
+    # Arrêts
+    # -------------------------------------------------
+
+    def quick_stop(self):
+        """Arrête les mouvements (M410). Utilisable pendant un mouvement."""
+
+        self._abort.set()
+        self._write_raw(gcode.quick_stop())
+
+    def emergency_stop(self):
+        """Arrêt d'urgence (M112) : un redémarrage de la carte est nécessaire."""
+
+        self._abort.set()
+        self._write_raw(gcode.emergency_stop())
+        self.last_position = None
+        self.homed = False
+
+    # -------------------------------------------------
+    # Limites de sécurité
+    # -------------------------------------------------
+
+    def check_target(self, target):
+        """Vérifie qu'une cible {"X":.., ...} est dans les limites."""
+
+        if not config.ENFORCE_LIMITS:
+            return
+
+        for axis, value in target.items():
+
+            if value is None or axis not in self.limits:
+                continue
+
+            low, high = self.limits[axis]
+
+            if value < low - 1e-6 or value > high + 1e-6:
+                raise PrinterError(
+                    f"{axis} = {value:g} mm hors limites "
+                    f"({low:g} à {high:g} mm)."
+                )
 
     # -------------------------------------------------
     # Position
     # -------------------------------------------------
 
-    def get_position(self):
+    def _refresh_position_locked(self, wait_for_moves=False):
+        if wait_for_moves:
+            self._send_command_locked(gcode.wait_for_moves(), timeout=config.MOVE_TIMEOUT)
+        for line in self._send_command_locked(gcode.get_position()):
+            position = gcode.parse_position(line)
+            if position:
+                self.last_position = position
+                return position
+        raise PrinterError("Réponse M114 illisible.")
 
-        return self.send_command(
-            "M114"
-        )
+    def get_position(self, wait_for_moves=False):
+        """Retourne la position machine ; sans attente de mouvement par défaut."""
+        with self.command_lock:
+            self._abort.clear()
+            return self._refresh_position_locked(wait_for_moves=wait_for_moves)
+
+    def poll_position(self):
+        """Interroge M114 seulement si le port n'est pas déjà utilisé."""
+        if not self.is_connected():
+            return None
+        if not self.command_lock.acquire(blocking=False):
+            return None
+        try:
+            self._abort.clear()
+            return self._refresh_position_locked(wait_for_moves=False)
+        finally:
+            self.command_lock.release()
+
+    # -------------------------------------------------
+    # HOME
+    # -------------------------------------------------
+
+    def home(self, axes=None):
+
+        with self.command_lock:
+
+            self._abort.clear()
+
+            responses = self._send_command_locked(
+                gcode.home(axes),
+                timeout=config.HOME_TIMEOUT
+            )
+
+            if not axes:
+                self.homed = True
+
+            self._refresh_position_locked(wait_for_moves=True)
+
+            return responses
+
+    def _wait_for_target_locked(self, target, timeout=None):
+        """Attend la fin du mouvement puis lit UNE fois la position réelle."""
+        if self._abort.is_set():
+            raise PrinterError("Commande interrompue.")
+        timeout = config.MOVE_TIMEOUT if timeout is None else timeout
+        # Une seule synchronisation de mouvement : aucun M114 pendant le trajet.
+        self._send_command_locked(gcode.wait_for_moves(), timeout=timeout)
+        if self._abort.is_set():
+            raise PrinterError("Commande interrompue.")
+        return self._refresh_position_locked(wait_for_moves=False)
 
     # -------------------------------------------------
     # Déplacement relatif
     # -------------------------------------------------
 
-    def move_relative(
-        self,
-        axis,
-        distance,
-        speed=None
-    ):
+    def move_relative(self, axis, distance, speed=None, wait=True):
 
-        if speed is None:
-            speed = 300
+        axis = axis.upper()
+
+        self._check_speed(speed)
+
+        commands = gcode.relative_move(axis, distance, speed)
 
         with self.command_lock:
 
+            self._abort.clear()
+
+            target = None
+            if self.last_position is not None:
+                target = self.last_position[axis] + distance
+                self.check_target({axis: target})
+
             responses = []
 
-            responses += self._send_command_locked(
-                "G91"
-            )
+            responses += self._send_command_locked(commands[0])
 
-            responses += self._send_command_locked(
-                f"G1 {axis}{distance:g} F{speed}"
-            )
+            try:
+                responses += self._send_command_locked(commands[1])
+            finally:
+                # Ne jamais rester en mode relatif.
+                try:
+                    responses += self._send_command_locked(
+                        commands[2],
+                        timeout=5
+                    )
+                except Exception:
+                    pass
 
-            responses += self._send_command_locked(
-                "G90"
-            )
+            if wait:
+                if target is not None:
+                    self._wait_for_target_locked({axis: target})
+                else:
+                    self._refresh_position_locked(wait_for_moves=True)
 
             return responses
 
@@ -220,43 +527,38 @@ class Printer:
     # Déplacement absolu
     # -------------------------------------------------
 
-    def move_absolute(
-        self,
-        x=None,
-        y=None,
-        z=None,
-        speed=None
-    ):
+    def move_absolute(self, x=None, y=None, z=None, speed=None, wait=True):
 
-        if speed is None:
-            speed = 300
+        self._check_speed(speed)
 
-        command = "G90\nG1"
+        commands = gcode.absolute_move(x, y, z, speed)
 
-        if x is not None:
-            command += f" X{x:g}"
-
-        if y is not None:
-            command += f" Y{y:g}"
-
-        if z is not None:
-            command += f" Z{z:g}"
-
-        command += f" F{speed}"
+        self.check_target({"X": x, "Y": y, "Z": z})
 
         with self.command_lock:
 
+            self._abort.clear()
+
             responses = []
 
-            responses += self._send_command_locked(
-                "G90"
-            )
+            for command in commands:
+                responses += self._send_command_locked(command)
 
-            responses += self._send_command_locked(
-                command.split("\n")[1]
-            )
+            if wait:
+                self._wait_for_target_locked({"X": x, "Y": y, "Z": z})
 
             return responses
+
+    def _check_speed(self, speed):
+
+        if speed is None:
+            return
+
+        if speed <= 0 or speed > config.MAX_SPEED:
+            raise PrinterError(
+                f"Vitesse {speed:g} mm/min invalide "
+                f"(1 à {config.MAX_SPEED} mm/min)."
+            )
 
     # -------------------------------------------------
     # Informations firmware
@@ -264,6 +566,4 @@ class Printer:
 
     def firmware_info(self):
 
-        return self.send_command(
-            "M115"
-        )
+        return self.send_command(gcode.firmware_info())

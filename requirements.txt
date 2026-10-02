@@ -1,0 +1,5 @@
+pyserial>=3.5
+
+# Optionnel : acquisition avec une carte NI (USB-6001).
+# Nécessite aussi le pilote NI-DAQmx installé sur le PC.
+# nidaqmx

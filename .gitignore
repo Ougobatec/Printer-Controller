@@ -31,3 +31,6 @@ config_local.py
 
 # Programmes locaux
 programs/*.json
+
+# Mesures exportées
+mesures_*.csv

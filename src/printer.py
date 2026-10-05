@@ -377,10 +377,32 @@ class Printer:
     # -------------------------------------------------
 
     def quick_stop(self):
-        """Arrête les mouvements (M410). Utilisable pendant un mouvement."""
+        """Arrête immédiatement puis lit une seule fois la position réelle."""
 
+        if not self.is_connected():
+            return None
+
+        # M410 doit partir immédiatement, même si une autre commande est
+        # actuellement bloquée dans une lecture série.
         self._abort.set()
         self._write_raw(gcode.quick_stop())
+
+        # L'ancienne commande doit avoir libéré le lecteur série avant que
+        # cette méthode ne lise G90/M114.
+        with self.command_lock:
+            try:
+                self._abort.clear()
+
+                # La réponse éventuelle de M410 peut avoir été consommée par
+                # la commande interrompue : on ne dépend donc pas de son ok.
+                self._send_command_locked("G90", timeout=2.0)
+
+                # Une seule lecture de position après l'arrêt effectif.
+                return self._send_m114_and_wait(timeout=3.0)
+
+            except Exception:
+                self._abort.clear()
+                return self.last_position
 
     def emergency_stop(self):
         """Arrêt d'urgence (M112) : un redémarrage de la carte est nécessaire."""

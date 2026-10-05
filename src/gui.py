@@ -1,8 +1,14 @@
 """Interface principale du contrôleur d'imprimante.
 
-Une seule page de travail : connexion + télécommande à gauche, points et
-programmes au centre, logs et terminal en bas. Les programmes et les points
-sont éditables hors connexion. La partie acquisition reste masquée.
+Une seule fenêtre, trois zones :
+
+* à gauche  : la machine (position, télécommande, vitesse, arrêts) ;
+* au centre : la vue 3D et l'éditeur de point ;
+* à droite  : le programme (liste de positions, lancement) ;
+* en bas    : console repliable (échanges série + terminal G-code).
+
+La connexion se trouve dans la barre du haut. Les programmes et les points
+restent éditables hors connexion.
 """
 
 import math
@@ -11,11 +17,62 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 import config
 from printer import Printer, PrinterError, list_ports
-from program import ERROR, FINISHED, RUNNING, STOPPED, Program, ProgramError, ProgramRunner, Waypoint
+from program import ERROR, FINISHED, STOPPED, Program, ProgramError, ProgramRunner, Waypoint
+
+
+# ----------------------------------------------------------------------
+# Thème
+# ----------------------------------------------------------------------
+
+C = {
+    "bg": "#f4f5f7",
+    "surface": "#ffffff",
+    "line": "#e4e6eb",
+    "soft": "#f1f2f5",
+    "soft_hover": "#e6e8ed",
+    "soft_press": "#dcdfe5",
+    "text": "#1b1d21",
+    "muted": "#7a808b",
+    "faint": "#b6bbc5",
+    "accent": "#2563eb",
+    "accent_hover": "#1d4fd0",
+    "accent_press": "#1a43b3",
+    "accent_soft": "#e6eeff",
+    "danger": "#d92d20",
+    "danger_hover": "#b42318",
+    "danger_press": "#912018",
+    "danger_soft": "#fdecea",
+    "danger_soft_hover": "#fadad6",
+    "ok": "#12a150",
+    "ok_soft": "#e3f6ea",
+    "warn": "#e8890c",
+    "grid": "#eceef2",
+    "edge": "#d3d7de",
+    "path": "#9db4ee",
+    "axis_x": "#e5484d",
+    "axis_y": "#30a46c",
+    "axis_z": "#3e63dd",
+    "console": "#14161a",
+    "console_text": "#d7dae0",
+    "console_input": "#1d2027",
+    "console_line": "#2a2e37",
+}
+
+STATUS_COLORS = {
+    "idle": C["faint"],
+    "ok": C["ok"],
+    "busy": C["warn"],
+    "run": C["accent"],
+    "error": C["danger"],
+}
+
+PROGRAM_FIELDS = ("x", "y", "z", "vitesse", "attente")
+NO_POSITION = "—"
 
 
 def parse_float(text, name="valeur"):
@@ -29,7 +86,66 @@ def parse_float(text, name="valeur"):
 
 
 def fmt(value):
-    return "—" if value is None else f"{value:g}"
+    return NO_POSITION if value is None else f"{value:g}"
+
+
+class Tooltip:
+    """Petite bulle d'aide affichée après un court survol."""
+
+    def __init__(self, widget, text, delay=550):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._job = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._hide()
+        self._job = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        self._job = None
+        if self._tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(tip, text=self.text, bg=C["text"], fg="white", padx=9, pady=5,
+                 justify="left", wraplength=280).pack()
+        self._tip = tip
+
+    def _hide(self, _event=None):
+        if self._job is not None:
+            self.widget.after_cancel(self._job)
+            self._job = None
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+class ThinProgress(tk.Canvas):
+    """Barre de progression fine (4 px)."""
+
+    def __init__(self, parent):
+        super().__init__(parent, height=4, bg=C["soft"], highlightthickness=0)
+        self._percent = 0.0
+        self.bind("<Configure>", lambda _e: self._redraw())
+
+    def set(self, percent):
+        self._percent = max(0.0, min(100.0, float(percent)))
+        self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        width = self.winfo_width()
+        if self._percent > 0:
+            self.create_rectangle(0, 0, width * self._percent / 100, 4,
+                                  fill=C["accent"], outline="")
 
 
 class EnderGUI:
@@ -38,10 +154,10 @@ class EnderGUI:
     def __init__(self, root, port=None):
         self.root = root
         self.root.title("Contrôle imprimante")
-        self.root.geometry("1440x960")
-        self.root.minsize(1120, 760)
-        self.root.configure(bg="#e9eaec")
+        self._place_window()
+        self.root.configure(bg=C["bg"])
 
+        # --- État -----------------------------------------------------
         self.connected = False
         self.busy = False
         self.running = False
@@ -56,32 +172,30 @@ class EnderGUI:
         self.history_index = 0
         self.program_path = None
         self.program_start_position = None
-        self.selected_point = None
         self.step_text = ""
+        self.current_step = None
+        self._last_selected = None
+        self._program_edit_entry = None
+        self._draw_job = None
+        self._grip = None
+        self._status_kind = "idle"
 
-        # Compatibilité avec l'ancienne API / tests.
-        self.step_var = tk.DoubleVar(value=1.0)
-        self.rate_var = tk.StringVar(value="10")
-        self.average_var = tk.StringVar(value="5")
-        self.measure_var = tk.BooleanVar(value=True)
-        self.value_var = tk.StringVar(value="--")
-        self.count_var = tk.StringVar(value="0 mesure")
+        # Appelé avec (index, waypoint, position) quand un point du programme
+        # est atteint : point d'accroche pour brancher une acquisition.
+        self.on_point_reached = None
 
+        # --- Variables Tk ---------------------------------------------
         self.port_var = tk.StringVar(value=port or config.PORT)
-        self.speed_var = tk.IntVar(value=config.DEFAULT_SPEED)
-        self.position_var = tk.StringVar(value="X : --     Y : --     Z : --")
+        self.speed_var = tk.StringVar(value=str(config.DEFAULT_SPEED))
         self.status_var = tk.StringVar(value="Déconnecté")
         self.program_name_var = tk.StringVar(value="Sans titre")
         self.progress_var = tk.StringVar(value="")
         self.logs_visible = tk.BooleanVar(value=True)
-        self.log_height_var = tk.IntVar(value=7)
-
         self.point_vars = {a: tk.StringVar() for a in "XYZ"}
-        self.point_step_var = tk.DoubleVar(value=1.0)
-        self._program_edit_entry = None
-        self.goto_vars = {a: tk.StringVar() for a in "XYZ"}
-        self.edit_vars = {k: tk.StringVar() for k in ("x", "y", "z", "vitesse", "attente")}
+        self.point_step_var = tk.StringVar(value="1")
+        self.pos_vars = {a: tk.StringVar(value=NO_POSITION) for a in "XYZ"}
 
+        # --- Imprimante / programme -----------------------------------
         self.printer = self.create_printer(port or config.PORT)
         self.printer.on_traffic = self.on_traffic
         self.program = Program()
@@ -92,26 +206,29 @@ class EnderGUI:
             on_state=lambda s, m: self.post(self.run_state_changed, s, m),
         )
 
-        # Caméras 3D : rotation + translation + zoom.
-        # Vue initiale : X et Y sont volontairement échangés dans le schéma.
-        # X+ suit donc la direction graphique qui représentait Y, et inversement.
-        # C'est strictement graphique : les commandes G-code gardent leurs axes.
-        self.view_yaw = 0.68 + math.pi
-        self.view_pitch = 0.52
-        self.view_zoom = 0.65
-        # Vue initiale : origine des axes sur le côté gauche du volume.
-        self.view_pan_x = -105.0
-        self.view_pan_y = 35.0
+        # --- Caméra 3D ------------------------------------------------
+        # X et Y sont volontairement échangés dans le schéma (graphique
+        # uniquement : les commandes G-code gardent leurs axes).
+        self.reset_camera(redraw=False)
         self.view_drag = None
-        # Les deux vues 3D partagent exactement le même repère/caméra afin
-        # que les axes et les gestes de rotation aient le même comportement.
 
         self.create_interface()
         self.refresh_program_tree()
         self.update_controls()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", lambda _e: self.quick_stop())
+        self.root.bind("<Control-s>", lambda _e: self.save_program())
         self.poll_events()
+
+    # ------------------------------------------------------------------
+    # Fenêtre
+    # ------------------------------------------------------------------
+    def _place_window(self):
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w, h = min(1360, sw - 40), min(880, sh - 90)
+        self.root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        self.root.minsize(min(1120, w), min(700, h))
+        self._small_screen = h < 800
 
     # ------------------------------------------------------------------
     # Threads / modèle
@@ -160,394 +277,618 @@ class EnderGUI:
             self.set_busy(False)
         message = str(error) or error.__class__.__name__
         self.write_log(f"ERREUR : {message}")
-        self.status_var.set(f"Erreur : {message}")
+        self.set_status(f"Erreur : {message}", "error")
         if self.connected and not self.printer.is_connected():
             self.mark_disconnected()
         if on_error:
             on_error(message)
 
     # ------------------------------------------------------------------
-    # Interface
+    # Styles
     # ------------------------------------------------------------------
-    def create_interface(self):
-        style = ttk.Style(self.root)
+    def _setup_fonts(self):
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(size=10)
+        family = tkfont.nametofont("TkDefaultFont").actual("family")
+        available = set(tkfont.families(self.root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas", "SF Mono", "Menlo",
+                                 "DejaVu Sans Mono", "Liberation Mono") if f in available),
+                    tkfont.nametofont("TkFixedFont").actual("family"))
+        self.f = {
+            "base": tkfont.Font(family=family, size=10),
+            "small": tkfont.Font(family=family, size=9),
+            "section": tkfont.Font(family=family, size=8, weight="bold"),
+            "bold": tkfont.Font(family=family, size=10, weight="bold"),
+            "title": tkfont.Font(family=family, size=12, weight="bold"),
+            "name": tkfont.Font(family=family, size=13, weight="bold"),
+            "jog": tkfont.Font(family=family, size=11, weight="bold"),
+            "mono": tkfont.Font(family=mono, size=9),
+            "mono_big": tkfont.Font(family=mono, size=13, weight="bold"),
+        }
+
+    def _setup_styles(self):
+        s = ttk.Style(self.root)
         try:
-            style.theme_use("clam")
+            s.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background="#e9eaec")
-        style.configure("TLabel", background="#e9eaec", foreground="#202326")
-        style.configure("TLabelframe", background="#e9eaec", bordercolor="#c7cbd0")
-        style.configure("TLabelframe.Label", background="#e9eaec", foreground="#34383d", font=("TkDefaultFont", 10, "bold"))
-        style.configure("TButton", padding=(10, 7), font=("TkDefaultFont", 9))
-        style.configure("Primary.TButton", padding=(12, 9), font=("TkDefaultFont", 9, "bold"))
-        style.configure("Treeview", rowheight=28, font=("TkDefaultFont", 9))
-        style.configure("Treeview.Heading", font=("TkDefaultFont", 9, "bold"))
-        style.configure("TEntry", padding=5)
-        style.configure("TCombobox", padding=4)
+        F = self.f
+        s.configure(".", background=C["surface"], foreground=C["text"], font=F["base"],
+                    borderwidth=0, focuscolor=C["surface"], focusthickness=0)
 
-        header = tk.Frame(self.root, bg="#24272b", height=58)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text="CONTRÔLE IMPRIMANTE", bg="#24272b", fg="#f5f5f5",
-                 font=("TkDefaultFont", 13, "bold")).pack(side="left", padx=18)
-        tk.Label(header, textvariable=self.status_var, bg="#24272b", fg="#bfc4c9",
-                 font=("TkDefaultFont", 9)).pack(side="left", padx=10)
-        tk.Label(header, textvariable=self.position_var, bg="#24272b", fg="#f5f5f5",
-                 font=("TkFixedFont", 11, "bold")).pack(side="right", padx=18)
+        def button(name, bg, fg, hover, press, dis_bg, dis_fg, pad=(14, 8), font=None):
+            s.configure(name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg,
+                        darkcolor=bg, focuscolor=bg, focusthickness=0, relief="flat",
+                        borderwidth=0, padding=pad, font=font or F["base"], anchor="center")
+            for key in ("background", "bordercolor", "lightcolor", "darkcolor"):
+                s.map(name, **{key: [("disabled", dis_bg), ("pressed", press), ("active", hover)]})
+            s.map(name, foreground=[("disabled", dis_fg)])
 
-        shell = ttk.Frame(self.root)
-        shell.pack(fill="both", expand=True, padx=12, pady=12)
+        soft = (C["soft"], C["text"], C["soft_hover"], C["soft_press"], C["soft"], C["faint"])
+        button("TButton", *soft)
+        button("Soft.TButton", *soft)
+        button("Accent.TButton", C["accent"], "white", C["accent_hover"], C["accent_press"],
+               "#b9cbf7", "white", pad=(14, 10), font=F["bold"])
+        button("Danger.TButton", C["danger"], "white", C["danger_hover"], C["danger_press"],
+               "#f1b9b4", "white", pad=(14, 10), font=F["bold"])
+        button("DangerSoft.TButton", C["danger_soft"], C["danger"], C["danger_soft_hover"],
+               "#f6c4be", C["soft"], C["faint"], pad=(14, 10), font=F["bold"])
+        button("Ghost.TButton", C["surface"], C["muted"], C["soft"], C["soft_hover"],
+               C["surface"], C["faint"], pad=(10, 6), font=F["small"])
+        button("Jog.TButton", C["soft"], C["text"], C["soft_hover"], C["accent_soft"],
+               C["soft"], C["faint"], pad=(0, 10), font=F["jog"])
+        button("Home.TButton", C["accent_soft"], C["accent"], "#d7e4ff", "#c8daff",
+               C["soft"], C["faint"], pad=(0, 10), font=F["bold"])
+        button("Tool.TButton", *soft, pad=(8, 7))
+        button("Chip.TButton", C["soft"], C["muted"], C["soft_hover"], C["soft_press"],
+               C["soft"], C["faint"], pad=(5, 4), font=F["small"])
+        button("ChipOn.TButton", C["accent_soft"], C["accent"], C["accent_soft"], C["accent_soft"],
+               C["accent_soft"], C["faint"], pad=(5, 4), font=F["bold"])
+        button("Mini.TButton", C["soft"], C["text"], C["soft_hover"], C["soft_press"],
+               C["soft"], C["faint"], pad=(0, 6), font=F["bold"])
+        button("Console.TButton", C["console"], C["console_text"], C["console_line"],
+               C["console_line"], C["console"], "#5b616e", pad=(10, 4), font=F["small"])
+        button("Send.TButton", C["accent"], "white", C["accent_hover"], C["accent_press"],
+               "#2b3a66", "#7f8bb0", pad=(14, 5), font=F["bold"])
 
-        sidebar_host = ttk.Frame(shell, width=310)
-        sidebar_host.pack(side="left", fill="y", padx=(0, 10))
-        sidebar_host.pack_propagate(False)
+        field = dict(fieldbackground=C["surface"], foreground=C["text"], bordercolor=C["line"],
+                     lightcolor=C["line"], darkcolor=C["line"], insertcolor=C["text"],
+                     padding=(8, 6))
+        focus = dict(bordercolor=[("focus", C["accent"])], lightcolor=[("focus", C["accent"])],
+                     darkcolor=[("focus", C["accent"])],
+                     fieldbackground=[("disabled", C["soft"])], foreground=[("disabled", C["faint"])])
+        for name in ("TEntry", "TSpinbox"):
+            s.configure(name, **field)
+            s.map(name, **focus)
+        s.configure("TCombobox", **field, background=C["soft"], arrowcolor=C["muted"],
+                    selectbackground=C["surface"], selectforeground=C["text"])
+        s.map("TCombobox", **focus, background=[("active", C["soft_hover"])],
+              arrowcolor=[("disabled", C["faint"])])
+        self.root.option_add("*TCombobox*Listbox.font", F["base"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", C["accent_soft"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", C["text"])
 
-        # Les deux arrêts restent hors de la zone défilante : ils sont toujours visibles.
-        safety_frame = ttk.LabelFrame(sidebar_host, text="Sécurité")
-        safety_frame.pack(fill="x", side="top", pady=(0, 8))
-        self.stop_button = ttk.Button(safety_frame, text="STOP", command=self.quick_stop)
-        self.stop_button.pack(fill="x", padx=9, pady=(9, 4))
-        self.emergency_button = tk.Button(
-            safety_frame, text="ARRÊT D'URGENCE", command=self.emergency_stop,
-            bg="#b3261e", fg="white", activebackground="#8d1712", activeforeground="white",
-            relief="flat", bd=0, font=("TkDefaultFont", 9, "bold"), pady=9
-        )
-        self.emergency_button.pack(fill="x", padx=9, pady=(4, 9))
+        s.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        s.configure("Treeview", background=C["surface"], fieldbackground=C["surface"],
+                    foreground=C["text"], rowheight=32, borderwidth=0, font=F["base"])
+        s.map("Treeview", background=[("selected", C["accent_soft"])],
+              foreground=[("selected", C["text"])])
+        s.configure("Treeview.Heading", background=C["surface"], foreground=C["muted"],
+                    font=F["section"], relief="flat", borderwidth=1, bordercolor=C["line"],
+                    lightcolor=C["surface"], darkcolor=C["surface"], padding=(6, 8))
+        s.map("Treeview.Heading", background=[("active", C["surface"])])
 
-        scroll_host = ttk.Frame(sidebar_host)
-        scroll_host.pack(fill="both", expand=True)
-        self.sidebar_canvas = tk.Canvas(scroll_host, bg="#e9eaec", highlightthickness=0, width=300)
-        self.sidebar_scroll = ttk.Scrollbar(scroll_host, orient="vertical", command=self.sidebar_canvas.yview)
-        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_scroll.set)
-        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
-        self.sidebar = ttk.Frame(self.sidebar_canvas, width=290)
-        self.sidebar_window = self.sidebar_canvas.create_window((0, 0), window=self.sidebar, anchor="nw")
-        self.sidebar.bind("<Configure>", lambda _e: self._update_sidebar_scrollbar())
-        self.sidebar_canvas.bind("<Configure>", lambda e: (
-            self.sidebar_canvas.itemconfigure(self.sidebar_window, width=max(270, e.width)),
-            self._update_sidebar_scrollbar()
-        ))
-        # La molette est capturée globalement uniquement lorsqu'elle se trouve
-        # réellement dans la colonne gauche. Le scrollregion est recalculé
-        # exactement sur le contenu afin d'éviter les marges artificielles.
-        self.sidebar_canvas.bind_all("<MouseWheel>", self._sidebar_wheel, add="+")
-        self.sidebar_canvas.bind_all("<Button-4>", self._sidebar_wheel, add="+")
-        self.sidebar_canvas.bind_all("<Button-5>", self._sidebar_wheel, add="+")
+        for name, thumb, trough in (("Thin", C["faint"], C["surface"]),
+                                    ("Dark", C["console_line"], C["console"])):
+            style = f"{name}.Vertical.TScrollbar"
+            s.layout(style, [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+            s.configure(style, background=thumb, troughcolor=trough, bordercolor=trough,
+                        lightcolor=thumb, darkcolor=thumb, width=8, gripcount=0)
+            s.map(style, background=[("active", C["muted"])])
 
-        self.create_connection(self.sidebar)
-        self.create_remote(self.sidebar)
-        self._update_sidebar_scrollbar()
 
-        self.center_host = ttk.Frame(shell)
-        self.center_host.pack(side="left", fill="both", expand=True)
-        self.create_scrollable_workspace(self.center_host)
-        self.create_bottom_area()
+    # ------------------------------------------------------------------
+    # Construction de l'interface
+    # ------------------------------------------------------------------
+    def create_interface(self):
+        self._setup_fonts()
+        self._setup_styles()
+        self.create_topbar()
+        self.create_console()  # empaqueté avant le corps pour garder sa hauteur
 
-    def _update_sidebar_scrollbar(self):
-        if not hasattr(self, "sidebar_canvas") or not hasattr(self, "sidebar_scroll"):
-            return
-        self.root.update_idletasks()
-        bbox = self.sidebar_canvas.bbox(self.sidebar_window)
-        visible = max(1, self.sidebar_canvas.winfo_height())
-        content = (bbox[3] - bbox[1]) if bbox else 0
-        width = max(1, self.sidebar_canvas.winfo_width())
-        # Le canvas doit avoir exactement la taille de son contenu : pas de
-        # zone vide ajoutée en haut ou en bas par un scrollregion implicite.
-        self.sidebar_canvas.configure(scrollregion=(0, 0, width, max(visible, content)))
-        if content > visible + 1:
-            self.sidebar_scroll.pack(side="right", fill="y")
-        else:
-            self.sidebar_scroll.pack_forget()
-            self.sidebar_canvas.yview_moveto(0)
+        # Page défilante : si la fenêtre est trop basse, une barre apparaît.
+        host = tk.Frame(self.root, bg=C["bg"])
+        host.pack(fill="both", expand=True)
+        self.page_canvas = tk.Canvas(host, bg=C["bg"], highlightthickness=0)
+        self.page_scroll = ttk.Scrollbar(host, orient="vertical", style="Thin.Vertical.TScrollbar",
+                                         command=self.page_canvas.yview)
+        self.page_canvas.configure(yscrollcommand=self.page_scroll.set)
+        self.page_canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(self.page_canvas, bg=C["bg"])
+        self.page_window = self.page_canvas.create_window((0, 0), window=body, anchor="nw")
+        self.page_canvas.bind("<Configure>", self._page_resize)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(sequence, self._page_wheel, add="+")
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
-    def _sidebar_wheel(self, event):
-        if not self.sidebar_scroll.winfo_ismapped():
+        left = self.card(body, width=300)
+        left.grid(row=0, column=0, sticky="ns", padx=(12, 0), pady=12)
+        left.pack_propagate(False)
+        self.create_machine_panel(left)
+
+        center = tk.Frame(body, bg=C["bg"])
+        center.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
+        self.create_view_panel(center)
+        self.create_point_panel(center)
+
+        right = self.card(body, width=410)
+        right.grid(row=0, column=2, sticky="ns", padx=(0, 12), pady=12)
+        right.pack_propagate(False)
+        self.create_program_panel(right)
+
+        if self._small_screen:
+            self.set_console_visible(False)
+
+    MIN_PAGE_HEIGHT = 640
+
+    def _page_resize(self, event):
+        height = max(event.height, self.MIN_PAGE_HEIGHT)
+        needs_scroll = height > event.height
+        if needs_scroll and not self.page_scroll.winfo_ismapped():
+            self.page_scroll.pack(side="right", fill="y")
+        elif not needs_scroll and self.page_scroll.winfo_ismapped():
+            self.page_scroll.pack_forget()
+            self.page_canvas.yview_moveto(0)
+        self.page_canvas.itemconfigure(self.page_window, width=event.width, height=height)
+        self.page_canvas.configure(scrollregion=(0, 0, event.width, height))
+
+    def _page_wheel(self, event):
+        if not self.page_scroll.winfo_ismapped():
             return
         widget = self.root.winfo_containing(event.x_root, event.y_root)
-        if widget is None:
+        if widget is None or widget.winfo_toplevel() is not self.root:
             return
-        current = widget
-        inside = False
-        while current is not None:
-            if current == self.sidebar_canvas:
-                inside = True
-                break
-            try:
-                current = current.master
-            except AttributeError:
-                break
-        if not inside:
+        # La vue 3D (zoom), le tableau et la console gardent leur molette.
+        if widget in (getattr(self, "view", None), getattr(self, "log", None),
+                      getattr(self, "program_tree", None)):
             return
         if getattr(event, "num", None) == 4:
             units = -3
         elif getattr(event, "num", None) == 5:
             units = 3
         else:
-            delta = getattr(event, "delta", 0)
-            units = -3 if delta > 0 else 3
-        self.sidebar_canvas.yview_scroll(units, "units")
+            units = -3 if getattr(event, "delta", 0) > 0 else 3
+        self.page_canvas.yview_scroll(units, "units")
 
-    def create_connection(self, parent):
-        frame = ttk.LabelFrame(parent, text="Connexion")
-        frame.pack(fill="x", pady=(0, 10))
-        row = ttk.Frame(frame)
-        row.pack(fill="x", padx=9, pady=9)
-        ttk.Label(row, text="Port").pack(side="left")
-        self.port_combo = ttk.Combobox(row, textvariable=self.port_var, values=list_ports(), width=12)
-        self.port_combo.pack(side="left", padx=7, fill="x", expand=True)
-        ttk.Button(row, text="Actualiser", width=10, command=self.refresh_ports).pack(side="right")
-        self.connect_button = ttk.Button(frame, text="Connecter", style="Primary.TButton", command=self.toggle_connection)
-        self.connect_button.pack(fill="x", padx=9, pady=(0, 9))
-        self.w_connection = [self.port_combo, self.connect_button]
+    # --- Helpers -------------------------------------------------------
+    def card(self, parent, **kw):
+        return tk.Frame(parent, bg=C["surface"], highlightthickness=1,
+                        highlightbackground=C["line"], highlightcolor=C["line"], **kw)
 
-    def create_remote(self, parent):
-        frame = ttk.LabelFrame(parent, text="Télécommande")
-        frame.pack(fill="x", pady=(0, 10))
-        grid = tk.Frame(frame, bg="#e9eaec")
-        grid.pack(pady=9)
-        self.remote_buttons = []
+    def section(self, parent, text, pady=(0, 6)):
+        label = tk.Label(parent, text=text.upper(), bg=C["surface"], fg=C["muted"],
+                         font=self.f["section"], anchor="w")
+        label.pack(fill="x", pady=pady)
+        return label
+
+    def tip(self, widget, text):
+        Tooltip(widget, text)
+        return widget
+
+    # --- Barre du haut -------------------------------------------------
+    def create_topbar(self):
+        bar = tk.Frame(self.root, bg=C["surface"], height=58)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Frame(self.root, bg=C["line"], height=1).pack(fill="x")
+
+        # Côté droit empaqueté en premier : les arrêts restent toujours visibles.
+        self.emergency_button = ttk.Button(bar, text="ARRÊT D'URGENCE", style="Danger.TButton",
+                                           command=self.emergency_stop)
+        self.emergency_button.pack(side="right", padx=(8, 20))
+        self.tip(self.emergency_button,
+                 "Envoie M112 et coupe la connexion. Redémarrer l'imprimante avant de se reconnecter.")
+        self.stop_button = ttk.Button(bar, text="STOP", style="DangerSoft.TButton",
+                                      command=self.quick_stop)
+        self.stop_button.pack(side="right")
+        self.tip(self.stop_button, "Interrompt le mouvement en cours (M410). Raccourci : Échap.")
+        tk.Frame(bar, bg=C["line"], width=1).pack(side="right", fill="y", pady=14, padx=16)
+
+        self.connect_button = ttk.Button(bar, text="Connecter", style="Accent.TButton",
+                                         command=self.toggle_connection)
+        self.connect_button.pack(side="right")
+        self.refresh_button = ttk.Button(bar, text="↻", width=3, style="Soft.TButton",
+                                         command=self.refresh_ports)
+        self.refresh_button.pack(side="right", padx=(0, 8))
+        self.tip(self.refresh_button, "Actualiser la liste des ports série")
+        self.port_combo = ttk.Combobox(bar, textvariable=self.port_var, values=list_ports(), width=10)
+        self.port_combo.pack(side="right", padx=8)
+        tk.Label(bar, text="Port", bg=C["surface"], fg=C["muted"],
+                 font=self.f["small"]).pack(side="right")
+        self.w_connection = [self.port_combo, self.connect_button, self.refresh_button]
+
+        tk.Label(bar, text="Contrôle imprimante", bg=C["surface"], fg=C["text"],
+                 font=self.f["title"]).pack(side="left", padx=(20, 18))
+        status = tk.Frame(bar, bg=C["surface"])
+        status.pack(side="left")
+        self.status_dot = tk.Canvas(status, width=10, height=10, bg=C["surface"],
+                                    highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(0, 8))
+        self._dot = self.status_dot.create_oval(1, 1, 9, 9, fill=C["faint"], outline="")
+        self.status_label = tk.Label(status, textvariable=self.status_var, bg=C["surface"],
+                                     fg=C["muted"], font=self.f["base"], anchor="w")
+        self.status_label.pack(side="left")
+
+    # --- Colonne machine -----------------------------------------------
+    def create_machine_panel(self, parent):
+        pad = tk.Frame(parent, bg=C["surface"])
+        pad.pack(fill="both", expand=True, padx=16, pady=16)
         self.w_motion = []
 
+        # Position
+        self.section(pad, "Position (mm)")
+        tiles = tk.Frame(pad, bg=C["surface"])
+        tiles.pack(fill="x", pady=(0, 16))
+        axis_colors = {"X": C["axis_x"], "Y": C["axis_y"], "Z": C["axis_z"]}
+        for i, axis in enumerate("XYZ"):
+            tiles.grid_columnconfigure(i, weight=1, uniform="tile", minsize=82)
+            tile = tk.Frame(tiles, bg=C["soft"])
+            tile.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+            tk.Label(tile, text=axis, bg=C["soft"], fg=axis_colors[axis],
+                     font=self.f["section"]).pack(anchor="w", padx=8, pady=(7, 0))
+            tk.Label(tile, textvariable=self.pos_vars[axis], bg=C["soft"], fg=C["text"],
+                     font=self.f["mono_big"], anchor="w").pack(fill="x", padx=8, pady=(0, 7))
+
+        # Télécommande
+        self.section(pad, "Déplacement")
+        grid = tk.Frame(pad, bg=C["surface"])
+        grid.pack(fill="x")
+        for col in (0, 1, 2, 4):
+            grid.grid_columnconfigure(col, weight=1, uniform="jog")
+        grid.grid_columnconfigure(3, minsize=16)
+
         def jog_button(text, axis, direction, row, col):
-            b = ttk.Button(grid, text=text, width=8)
-            b.grid(row=row, column=col, padx=4, pady=4, ipadx=2, ipady=3)
+            b = ttk.Button(grid, text=text, style="Jog.TButton")
+            b.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
             b.bind("<ButtonPress-1>", lambda _e: self.start_jog(axis, direction))
             b.bind("<ButtonRelease-1>", lambda _e: self.stop_jog())
             b.bind("<Leave>", lambda _e: self.stop_jog())
-            self.remote_buttons.append(b)
             self.w_motion.append(b)
             return b
 
         jog_button("Y +", "Y", 1, 0, 1)
-        jog_button("X -", "X", -1, 1, 0)
-        self.home_button = ttk.Button(grid, text="0,0,0", width=8, command=self.home)
-        self.home_button.grid(row=1, column=1, padx=4, pady=4, ipadx=2, ipady=3)
-        self.remote_buttons.append(self.home_button)
+        jog_button("X −", "X", -1, 1, 0)
+        self.home_button = ttk.Button(grid, text="0,0,0", style="Home.TButton", command=self.home)
+        self.home_button.grid(row=1, column=1, padx=3, pady=3, sticky="nsew")
+        self.tip(self.home_button, "Aller à X0 Y0 Z0")
         self.w_motion.append(self.home_button)
         jog_button("X +", "X", 1, 1, 2)
-        jog_button("Y -", "Y", -1, 2, 1)
-        jog_button("Z +", "Z", 1, 3, 1)
-        jog_button("Z -", "Z", -1, 4, 1)
+        jog_button("Y −", "Y", -1, 2, 1)
+        jog_button("Z +", "Z", 1, 0, 4)
+        tk.Label(grid, text="Z", bg=C["surface"], fg=C["faint"],
+                 font=self.f["section"]).grid(row=1, column=4)
+        jog_button("Z −", "Z", -1, 2, 4)
+        tk.Label(pad, text="Maintenir un bouton pour déplacer, relâcher pour arrêter.",
+                 bg=C["surface"], fg=C["muted"], font=self.f["small"], anchor="w",
+                 justify="left", wraplength=260).pack(fill="x", pady=(6, 16))
 
-        speed = ttk.Frame(frame)
-        speed.pack(fill="x", padx=10, pady=(2, 8))
-        ttk.Label(speed, text="Vitesse").pack(side="left")
-        self.speed_spin = ttk.Spinbox(speed, from_=1, to=config.MAX_SPEED, increment=50, textvariable=self.speed_var, width=8)
-        self.speed_spin.pack(side="right")
-        ttk.Label(speed, text="mm/min").pack(side="right", padx=(0, 6))
+        # Vitesse
+        self.section(pad, "Vitesse")
+        row = tk.Frame(pad, bg=C["surface"])
+        row.pack(fill="x")
+        self.speed_spin = ttk.Spinbox(row, from_=1, to=config.MAX_SPEED, increment=50,
+                                      textvariable=self.speed_var, width=7)
+        self.speed_spin.pack(side="left")
+        tk.Label(row, text="mm/min", bg=C["surface"], fg=C["muted"],
+                 font=self.f["small"]).pack(side="left", padx=8)
+        chips = tk.Frame(pad, bg=C["surface"])
+        chips.pack(fill="x", pady=(8, 16))
+        self.chips = {}
+        for i, value in enumerate(config.SPEED_SIZES):
+            chips.grid_columnconfigure(i, weight=1, uniform="chip")
+            chip = ttk.Button(chips, text=str(value), style="Chip.TButton",
+                              command=lambda v=value: self.speed_var.set(str(v)))
+            chip.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 3, 0))
+            self.chips[value] = chip
+        self.speed_var.trace_add("write", lambda *_: self.sync_speed_chips())
+        self.sync_speed_chips()
 
-        self.recalibrate_button = ttk.Button(frame, text="RECALIBRER", command=self.recalibrate)
-        self.recalibrate_button.pack(fill="x", padx=10, pady=3)
-        self.w_motion += [self.recalibrate_button]
+        self.recalibrate_button = ttk.Button(pad, text="Recalibrer (G28)", style="Soft.TButton",
+                                             command=self.recalibrate)
+        self.recalibrate_button.pack(fill="x")
+        self.tip(self.recalibrate_button, "Recherche des butées mécaniques de l'imprimante (G28).")
+        self.w_motion.append(self.recalibrate_button)
 
-    def create_side_status(self, parent):
-        frame = ttk.LabelFrame(parent, text="Machine")
-        frame.pack(fill="x")
-        self.side_position = tk.Label(frame, textvariable=self.position_var, bg="#e9eaec", fg="#202326",
-                                      font=("TkFixedFont", 11, "bold"), justify="left")
-        self.side_position.pack(anchor="w", padx=10, pady=10)
-        ttk.Label(frame, text="Maintenir un bouton pour déplacer. Relâcher pour arrêter.").pack(anchor="w", padx=10, pady=(0, 10))
+    def sync_speed_chips(self):
+        try:
+            current = float(str(self.speed_var.get()).replace(",", "."))
+        except ValueError:
+            current = None
+        for value, chip in self.chips.items():
+            chip.configure(style="ChipOn.TButton" if current == value else "Chip.TButton")
 
-    def create_scrollable_workspace(self, parent):
-        outer = ttk.Frame(parent)
-        outer.pack(fill="both", expand=True)
-        self.workspace_canvas = tk.Canvas(outer, bg="#e9eaec", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=self.workspace_canvas.yview)
-        self.workspace_canvas.configure(yscrollcommand=scrollbar.set)
-        self.workspace_canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.workspace = ttk.Frame(self.workspace_canvas)
-        self.workspace_window = self.workspace_canvas.create_window((0, 0), window=self.workspace, anchor="nw")
-        self.workspace.bind("<Configure>", lambda _e: self.workspace_canvas.configure(scrollregion=self.workspace_canvas.bbox("all")))
-        self.workspace_canvas.bind("<Configure>", lambda e: self.workspace_canvas.itemconfigure(self.workspace_window, width=e.width))
-        self.workspace_canvas.bind_all("<MouseWheel>", self._workspace_wheel, add="+")
+    # --- Vue 3D --------------------------------------------------------
+    def create_view_panel(self, parent):
+        card = self.card(parent)
+        card.pack(fill="both", expand=True)
+        self.view = tk.Canvas(card, bg=C["surface"], highlightthickness=0, height=300)
+        self.view.pack(fill="both", expand=True, padx=1, pady=1)
+        self._bind_view(self.view)
+        reset = ttk.Button(self.view, text="Recentrer la vue", style="Ghost.TButton",
+                           command=self.reset_camera)
+        reset.place(relx=1.0, x=-10, y=10, anchor="ne")
 
-        self.create_points_program_workspace(self.workspace)
+    def _bind_view(self, canvas):
+        canvas.bind("<Configure>", lambda _e: self.request_draw())
+        canvas.bind("<ButtonPress-1>", lambda e: self._view_press(e, "rotate"))
+        canvas.bind("<B1-Motion>", self._view_drag)
+        canvas.bind("<Shift-ButtonPress-1>", lambda e: self._view_press(e, "pan"))
+        canvas.bind("<Shift-B1-Motion>", self._view_drag)
+        for button in (2, 3):
+            canvas.bind(f"<ButtonPress-{button}>", lambda e: self._view_press(e, "pan"))
+            canvas.bind(f"<B{button}-Motion>", self._view_drag)
+        canvas.bind("<MouseWheel>", lambda e: self._zoom(1.1 if e.delta > 0 else 0.9))
+        canvas.bind("<Button-4>", lambda _e: self._zoom(1.1))
+        canvas.bind("<Button-5>", lambda _e: self._zoom(0.9))
 
-    def _workspace_wheel(self, event):
-        # Ne pas détourner la molette des vues 3D ni de la colonne gauche.
-        widget = self.root.winfo_containing(event.x_root, event.y_root)
-        if widget in (getattr(self, "canvas3d", None), getattr(self, "program_canvas", None)):
-            return
-        current = widget
-        while current is not None:
-            if current == getattr(self, "sidebar_canvas", None):
-                return
-            try:
-                current = current.master
-            except AttributeError:
-                break
-        self.workspace_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+    # --- Éditeur de point ----------------------------------------------
+    def create_point_panel(self, parent):
+        card = self.card(parent)
+        card.pack(fill="x", pady=(12, 0))
+        pad = tk.Frame(card, bg=C["surface"])
+        pad.pack(fill="x", padx=16, pady=14)
 
-    def create_points_program_workspace(self, parent):
-        # Un seul point de travail : il est éditable en permanence et n'est pas
-        # une collection de points indépendante du programme.
-        points_frame = ttk.LabelFrame(parent, text="Point")
-        points_frame.pack(fill="x", pady=(0, 10))
+        top = tk.Frame(pad, bg=C["surface"])
+        top.pack(fill="x", pady=(0, 8))
+        tk.Label(top, text="POINT", bg=C["surface"], fg=C["muted"],
+                 font=self.f["section"]).pack(side="left")
+        tk.Label(top, text="Position visée, affichée en orange dans la vue 3D",
+                 bg=C["surface"], fg=C["faint"], font=self.f["small"]).pack(side="left", padx=10)
 
-        point_body = ttk.Frame(points_frame)
-        point_body.pack(fill="x", padx=10, pady=10)
+        fields = tk.Frame(pad, bg=C["surface"])
+        fields.pack(fill="x")
+        for i in range(4):
+            fields.grid_columnconfigure(i, weight=1, uniform="pt")
+        for i, axis in enumerate("XYZ"):
+            group = tk.Frame(fields, bg=C["surface"])
+            group.grid(row=0, column=i, sticky="ew", padx=(0, 12))
+            tk.Label(group, text=axis, bg=C["surface"], fg=C["muted"], font=self.f["small"],
+                     anchor="w").pack(fill="x")
+            line = tk.Frame(group, bg=C["surface"])
+            line.pack(fill="x")
+            minus = ttk.Button(line, text="−", width=2, style="Mini.TButton",
+                               command=lambda a=axis: self.change_point_axis(a, -1))
+            minus.pack(side="left")
+            entry = ttk.Entry(line, textvariable=self.point_vars[axis], width=6)
+            entry.pack(side="left", fill="x", expand=True, padx=3)
+            entry.bind("<KeyRelease>", lambda _e: self.request_draw())
+            plus = ttk.Button(line, text="+", width=2, style="Mini.TButton",
+                              command=lambda a=axis: self.change_point_axis(a, 1))
+            plus.pack(side="left")
+        group = tk.Frame(fields, bg=C["surface"])
+        group.grid(row=0, column=3, sticky="ew")
+        tk.Label(group, text="Pas (mm)", bg=C["surface"], fg=C["muted"], font=self.f["small"],
+                 anchor="w").pack(fill="x")
+        ttk.Entry(group, textvariable=self.point_step_var, width=6).pack(fill="x")
 
-        edit_frame = ttk.Frame(point_body)
-        edit_frame.pack(side="left", fill="y", padx=(0, 12))
-        ttk.Label(edit_frame, text="Coordonnées", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 8))
-        for axis in "XYZ":
-            row = ttk.Frame(edit_frame)
-            row.pack(fill="x", pady=4)
-            ttk.Label(row, text=axis, width=3).pack(side="left")
-            entry = ttk.Entry(row, textvariable=self.point_vars[axis], width=11)
-            entry.pack(side="left")
-            entry.bind("<KeyRelease>", lambda _e: self.draw_3d())
-            ttk.Button(row, text="−", width=3, command=lambda a=axis: self.change_point_axis(a, -1)).pack(side="left", padx=(4, 2))
-            ttk.Button(row, text="+", width=3, command=lambda a=axis: self.change_point_axis(a, 1)).pack(side="left")
+        actions = tk.Frame(pad, bg=C["surface"])
+        actions.pack(fill="x", pady=(12, 0))
+        self.capture_button = ttk.Button(actions, text="Position actuelle", style="Soft.TButton",
+                                         command=self.capture_point)
+        self.capture_button.pack(side="left")
+        self.tip(self.capture_button, "Copier la position de la machine dans ce point.")
+        self.goto_button = ttk.Button(actions, text="Aller au point", style="Soft.TButton",
+                                      command=self.goto_selected_point)
+        self.goto_button.pack(side="left", padx=8)
+        self.add_point_button = ttk.Button(actions, text="Ajouter au programme  →",
+                                           style="Accent.TButton",
+                                           command=self.add_selected_to_program)
+        self.add_point_button.pack(side="right")
+        self.w_goto = [self.goto_button]
 
-        step_row = ttk.Frame(edit_frame)
-        step_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(step_row, text="Pas", width=3).pack(side="left")
-        ttk.Entry(step_row, textvariable=self.point_step_var, width=11).pack(side="left")
-        ttk.Label(step_row, text="mm", foreground="#5c6268").pack(side="left", padx=(5, 0))
+    # --- Programme -----------------------------------------------------
+    def create_program_panel(self, parent):
+        pad = tk.Frame(parent, bg=C["surface"])
+        pad.pack(fill="both", expand=True, padx=16, pady=16)
+        self.w_edit = []
 
-        ttk.Button(edit_frame, text="APPLIQUER POSITION ACTUELLE", command=self.capture_point).pack(fill="x", pady=(12, 4))
-        ttk.Button(edit_frame, text="DÉPLACER VERS LE POINT", command=self.goto_selected_point).pack(fill="x", pady=4)
-        ttk.Button(edit_frame, text="AJOUTER AU PROGRAMME", command=self.add_selected_to_program).pack(fill="x", pady=4)
-        ttk.Label(edit_frame, text="La position affichée est mise à jour\nen temps réel dans le schéma.", justify="left").pack(anchor="w", pady=(12, 0))
+        self.section(pad, "Programme")
+        name = ttk.Entry(pad, textvariable=self.program_name_var, font=self.f["name"])
+        name.pack(fill="x")
+        name.bind("<FocusOut>", lambda _e: self._sync_program_name())
+        name.bind("<Return>", lambda _e: (self._sync_program_name(), self.root.focus_set()))
+        self.w_edit.append(name)
 
-        view_frame = ttk.LabelFrame(point_body, text="Position XYZ")
-        view_frame.pack(side="left", fill="both", expand=True)
-        self.canvas3d = tk.Canvas(view_frame, bg="#f8f9fa", highlightthickness=1, highlightbackground="#d0d3d6", height=250, width=430)
-        self.canvas3d.pack(fill="both", expand=True)
-        self._bind_3d(self.canvas3d, "points")
+        files = tk.Frame(pad, bg=C["surface"])
+        files.pack(fill="x", pady=(8, 12))
+        for i, (text, command) in enumerate((("Nouveau", self.new_program),
+                                             ("Ouvrir", self.load_program),
+                                             ("Enregistrer", self.save_program))):
+            files.grid_columnconfigure(i, weight=1, uniform="file")
+            b = ttk.Button(files, text=text, style="Soft.TButton", command=command)
+            b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+            if text != "Enregistrer":
+                self.w_edit.append(b)
+            else:
+                self.save_program_button = b
+                self.tip(b, "Enregistrer le programme en JSON (Ctrl+S).")
 
-        # Compatibilité interne / tests : le Treeview reste caché et peut être
-        # alimenté par les acquisitions, mais il n'est jamais présenté à l'utilisateur.
-        self.points_tree = ttk.Treeview(self.root, columns=("name", "x", "y", "z"), show="headings")
-        self.points_tree.pack_forget()
-        self.points_tree.bind("<<TreeviewSelect>>", self.point_selected)
-        self.point_count_var = tk.StringVar(value="Point de travail")
+        # Run bar (en bas)
+        run = tk.Frame(pad, bg=C["surface"])
+        run.pack(side="bottom", fill="x", pady=(12, 0))
+        self.run_button = ttk.Button(run, text="▶  Lancer le programme", style="Accent.TButton",
+                                     command=self.run_program)
+        self.run_button.pack(fill="x")
+        second = tk.Frame(run, bg=C["surface"])
+        second.pack(fill="x", pady=(6, 0))
+        second.grid_columnconfigure(0, weight=1, uniform="run")
+        second.grid_columnconfigure(1, weight=1, uniform="run")
+        self.stop_program_button = ttk.Button(second, text="■  Stopper", style="Soft.TButton",
+                                              command=self.stop_program)
+        self.stop_program_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.return_button = ttk.Button(second, text="↩  Revenir au départ", style="Soft.TButton",
+                                        command=self.return_to_program_start)
+        self.return_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self.tip(self.return_button, "Retourne à la position où se trouvait la machine avant le lancement.")
 
-        program_frame = ttk.LabelFrame(parent, text="Programme")
-        program_frame.pack(fill="x", pady=(0, 10))
+        progress = tk.Frame(pad, bg=C["surface"])
+        progress.pack(side="bottom", fill="x", pady=(10, 0))
+        tk.Label(progress, textvariable=self.progress_var, bg=C["surface"], fg=C["muted"],
+                 font=self.f["small"], anchor="w").pack(fill="x", pady=(0, 4))
+        self.progress_bar = ThinProgress(progress)
+        self.progress_bar.pack(fill="x")
 
-        header = ttk.Frame(program_frame)
-        header.pack(fill="x", padx=10, pady=9)
-        ttk.Label(header, text="Nom").pack(side="left")
-        ttk.Entry(header, textvariable=self.program_name_var, width=28).pack(side="left", padx=7)
-        ttk.Button(header, text="Nouveau", command=self.new_program).pack(side="left", padx=3)
-        ttk.Button(header, text="Ouvrir", command=self.load_program).pack(side="left", padx=3)
-        ttk.Label(header, textvariable=self.progress_var).pack(side="right")
+        # Outils de lignes
+        tools = tk.Frame(pad, bg=C["surface"])
+        tools.pack(side="bottom", fill="x", pady=(8, 0))
+        specs = (("＋ Ligne", self.add_empty_program_point, "Ajouter une ligne vide à remplir ensuite.", 0),
+                 ("Remplir", self.fill_selected_program_point,
+                  "Remplir la ligne sélectionnée avec le point et la vitesse courants.", 0),
+                 ("▲", lambda: self.move_program_point(-1), "Monter la ligne.", 1),
+                 ("▼", lambda: self.move_program_point(1), "Descendre la ligne.", 1),
+                 ("Supprimer", self.delete_program_point, "Supprimer la ligne sélectionnée.", 0))
+        for i, (text, command, hint, small) in enumerate(specs):
+            tools.grid_columnconfigure(i, weight=0 if small else 1, uniform=None if small else "tool")
+            b = ttk.Button(tools, text=text, style="Tool.TButton", command=command,
+                           width=3 if small else None)
+            b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            self.tip(b, hint)
+            self.w_edit.append(b)
 
-        program_body = ttk.Frame(program_frame)
-        program_body.pack(fill="x", padx=10, pady=(0, 10))
-        table_frame = ttk.LabelFrame(program_body, text="Points du programme")
-        table_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        traj_frame = ttk.LabelFrame(program_body, text="Trajectoire 3D")
-        traj_frame.pack(side="left", fill="both", expand=True)
+        tk.Label(pad, text="Double-clic pour modifier · vitesse en mm/min · attente en s",
+                 bg=C["surface"], fg=C["muted"], font=self.f["small"],
+                 anchor="w").pack(side="bottom", fill="x", pady=(8, 0))
 
+        # Tableau
+        table = tk.Frame(pad, bg=C["surface"], highlightthickness=1,
+                         highlightbackground=C["line"], highlightcolor=C["line"])
+        table.pack(fill="both", expand=True)
         cols = ("n", "x", "y", "z", "speed", "wait")
-        self.program_tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse", height=8)
-        titles = {"n": "#", "x": "X", "y": "Y", "z": "Z", "speed": "Vitesse", "wait": "Attente"}
+        self.program_tree = ttk.Treeview(table, columns=cols, show="headings",
+                                         selectmode="browse", height=8)
+        titles = {"n": "#", "x": "X", "y": "Y", "z": "Z", "speed": "VITESSE", "wait": "ATTENTE"}
+        widths = {"n": 30, "x": 54, "y": 54, "z": 54, "speed": 72, "wait": 72}
         for col in cols:
-            self.program_tree.heading(col, text=titles[col])
-            self.program_tree.column(col, width=65 if col == "n" else 75, anchor="center" if col == "n" else "e")
-        self.program_tree.pack(fill="both", expand=True, padx=7, pady=7)
+            anchor = "center" if col == "n" else "e"
+            self.program_tree.heading(col, text=titles[col], anchor=anchor)
+            self.program_tree.column(col, width=widths[col], minwidth=30, anchor=anchor)
+        table.grid_columnconfigure(0, weight=1)
+        table.grid_rowconfigure(0, weight=1)
+        scroll = ttk.Scrollbar(table, orient="vertical", style="Thin.Vertical.TScrollbar",
+                               command=self.program_tree.yview)
+
+        def on_scroll(first, last):
+            scroll.set(first, last)
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                scroll.grid_remove()
+            else:
+                scroll.grid(row=0, column=1, sticky="ns")
+
+        self.program_tree.configure(yscrollcommand=on_scroll)
+        self.program_tree.grid(row=0, column=0, sticky="nsew")
+        self.program_tree.tag_configure("incomplete", foreground=C["faint"])
+        self.program_tree.tag_configure("active", background=C["ok_soft"])
         self.program_tree.bind("<<TreeviewSelect>>", self.program_selected)
         self.program_tree.bind("<Double-1>", self.edit_program_cell)
-        ttk.Label(table_frame, text="Double-cliquer sur X, Y, Z, vitesse ou attente pour modifier la valeur.", foreground="#5c6268").pack(anchor="w", padx=7, pady=(0, 5))
+        self.program_tree.bind("<Button-3>", self.program_menu)
+        self.program_tree.bind("<Button-2>", self.program_menu)
+        self.empty_hint = tk.Label(
+            self.program_tree, bg=C["surface"], fg=C["muted"], font=self.f["small"],
+            text="Aucun point.\nAjoutez-en depuis le panneau « Point ».", justify="center")
 
-        toolbar = ttk.Frame(table_frame)
-        toolbar.pack(fill="x", padx=7, pady=(0, 7))
-        for text, command in (("Ajouter point vide", self.add_empty_program_point),
-                              ("Remplir sélection", self.fill_selected_program_point),
-                              ("Supprimer", self.delete_program_point),
-                              ("Monter", lambda: self.move_program_point(-1)),
-                              ("Descendre", lambda: self.move_program_point(1))):
-            ttk.Button(toolbar, text=text, command=command).pack(side="left", padx=(0, 4))
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Aller à ce point", command=self.goto_program_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="Monter", command=lambda: self.move_program_point(-1))
+        self.menu.add_command(label="Descendre", command=lambda: self.move_program_point(1))
+        self.menu.add_command(label="Supprimer", command=self.delete_program_point)
 
-        self.program_canvas = tk.Canvas(traj_frame, bg="#f8f9fa", highlightthickness=1, highlightbackground="#d0d3d6", height=250, width=430)
-        self.program_canvas.pack(fill="both", expand=True)
-        self._bind_3d(self.program_canvas, "program")
+    # --- Console -------------------------------------------------------
+    def create_console(self):
+        self.console = tk.Frame(self.root, bg=C["console"])
+        self.console.pack(side="bottom", fill="x")
 
-        actions = ttk.Frame(program_frame)
-        actions.pack(fill="x", padx=10, pady=(0, 10))
-        self.run_button = ttk.Button(actions, text="LANCER LE PROGRAMME", style="Primary.TButton", command=self.run_program)
-        self.run_button.pack(side="left", padx=(0, 6))
-        self.stop_program_button = ttk.Button(actions, text="STOPPER", command=self.stop_program)
-        self.stop_program_button.pack(side="left", padx=4)
-        self.return_button = ttk.Button(actions, text="REVENIR AU DÉPART", command=self.return_to_program_start)
-        self.return_button.pack(side="left", padx=4)
-        self.save_program_button = ttk.Button(actions, text="ENREGISTRER", command=self.save_program)
-        self.save_program_button.pack(side="left", padx=4)
-        self.w_program = [self.run_button, self.stop_program_button, self.return_button]
+        grip = tk.Frame(self.console, bg=C["console_line"], height=4, cursor="sb_v_double_arrow")
+        grip.pack(fill="x")
+        grip.bind("<ButtonPress-1>", self._grip_press)
+        grip.bind("<B1-Motion>", self._grip_drag)
 
-        parent.update_idletasks()
-        self.draw_3d()
-        self.draw_program_preview()
+        header = tk.Frame(self.console, bg=C["console"])
+        header.pack(fill="x", padx=14, pady=(4, 2))
+        tk.Label(header, text="Console", bg=C["console"], fg=C["console_text"],
+                 font=self.f["bold"]).pack(side="left")
+        tk.Label(header, text="échanges avec l'imprimante · glisser la barre du haut pour redimensionner",
+                 bg=C["console"], fg="#5b616e", font=self.f["small"]).pack(side="left", padx=12)
+        self.console_toggle = ttk.Button(header, text="Masquer", style="Console.TButton",
+                                         command=self.toggle_console)
+        self.console_toggle.pack(side="right")
+        ttk.Button(header, text="Effacer", style="Console.TButton",
+                   command=self.clear_log).pack(side="right", padx=4)
 
-    def _bind_3d(self, canvas, kind):
-        canvas.bind("<Configure>", lambda _e: (self.draw_3d() if kind == "points" else self.draw_program_preview()))
-        canvas.bind("<ButtonPress-1>", lambda e: self._view_press(kind, e, "rotate"))
-        canvas.bind("<B1-Motion>", lambda e: self._view_drag(kind, e, "rotate"))
-        canvas.bind("<Shift-ButtonPress-1>", lambda e: self._view_press(kind, e, "pan"))
-        canvas.bind("<Shift-B1-Motion>", lambda e: self._view_drag(kind, e, "pan"))
-        canvas.bind("<ButtonPress-2>", lambda e: self._view_press(kind, e, "pan"))
-        canvas.bind("<B2-Motion>", lambda e: self._view_drag(kind, e, "pan"))
-        canvas.bind("<ButtonPress-3>", lambda e: self._view_press(kind, e, "pan"))
-        canvas.bind("<B3-Motion>", lambda e: self._view_drag(kind, e, "pan"))
-        canvas.bind("<MouseWheel>", lambda e: self._view_zoom_event(kind, e))
-        canvas.bind("<Button-4>", lambda _e: self._zoom(kind, 1.1))
-        canvas.bind("<Button-5>", lambda _e: self._zoom(kind, 0.9))
+        self.console_body = tk.Frame(self.console, bg=C["console"])
+        self.console_body.pack(fill="x", padx=14, pady=(2, 12))
 
-    def create_bottom_area(self):
-        bottom = ttk.LabelFrame(self.root, text="Journal et terminal")
-        bottom.pack(fill="x", padx=12, pady=(0, 12))
-        toolbar = ttk.Frame(bottom)
-        toolbar.pack(fill="x", padx=8, pady=6)
-        ttk.Label(toolbar, text="Échanges avec l'imprimante").pack(side="left")
-        ttk.Label(toolbar, text="Hauteur logs").pack(side="left", padx=(18, 5))
-        self.log_height_spin = ttk.Spinbox(
-            toolbar, from_=3, to=30, increment=1, width=4, textvariable=self.log_height_var,
-            command=self.apply_log_height
-        )
-        self.log_height_spin.pack(side="left")
-        self.log_height_spin.bind("<Return>", lambda _e: self.apply_log_height())
-        self.log_height_spin.bind("<FocusOut>", lambda _e: self.apply_log_height())
-        ttk.Checkbutton(toolbar, text="Afficher logs / terminal", variable=self.logs_visible, command=self.toggle_bottom_area).pack(side="right")
-
-        self.bottom_body = ttk.Frame(bottom)
-        self.bottom_body.pack(fill="x", padx=8, pady=(0, 8))
-
-        logs = ttk.LabelFrame(self.bottom_body, text="Logs imprimante")
-        logs.pack(fill="x", pady=(0, 6))
-        self.log = tk.Text(logs, height=self.log_height_var.get(), state="disabled", bg="#151719", fg="#d9dde1", insertbackground="white",
-                           relief="flat", font=("TkFixedFont", 9))
-        scroll = ttk.Scrollbar(logs, orient="vertical", command=self.log.yview)
+        logs = tk.Frame(self.console_body, bg=C["console"])
+        logs.pack(fill="x")
+        self.log = tk.Text(logs, height=5, state="disabled", bg=C["console"], fg=C["console_text"],
+                           insertbackground="white", relief="flat", highlightthickness=0,
+                           font=self.f["mono"], wrap="word", padx=0, pady=2)
+        scroll = ttk.Scrollbar(logs, orient="vertical", style="Dark.Vertical.TScrollbar",
+                               command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        # La molette dans les logs doit rester dans cette zone et ne jamais
-        # remonter vers le workspace/les conteneurs parents.
-        self.log.bind("<MouseWheel>", self._log_wheel)
-        self.log.bind("<Button-4>", self._log_wheel)
-        self.log.bind("<Button-5>", self._log_wheel)
+        for tag, color in (("stamp", "#5b616e"), ("tx", "#7aa2ff"), ("rx", "#9aa1ad"),
+                           ("err", "#ff7a70"), ("warn", "#f5b45a"), ("info", C["console_text"])):
+            self.log.tag_configure(tag, foreground=color)
+        # La molette reste dans la console.
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.log.bind(sequence, self._log_wheel)
 
-        terminal = ttk.Frame(self.bottom_body)
-        terminal.pack(fill="x")
-        ttk.Label(terminal, text="Terminal").pack(side="left", padx=(0, 8))
-        self.gcode_entry = ttk.Entry(terminal)
-        self.gcode_entry.pack(side="left", fill="x", expand=True)
+        terminal = tk.Frame(self.console_body, bg=C["console"])
+        terminal.pack(fill="x", pady=(8, 0))
+        tk.Label(terminal, text="›", bg=C["console"], fg="#7aa2ff",
+                 font=self.f["title"]).pack(side="left", padx=(0, 8))
+        self.gcode_entry = tk.Entry(
+            terminal, bg=C["console_input"], fg="#f1f3f6", insertbackground="white", relief="flat",
+            highlightthickness=1, highlightbackground=C["console_line"],
+            highlightcolor=C["accent"], font=self.f["mono"], disabledbackground=C["console"],
+            disabledforeground="#5b616e")
+        self.gcode_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.gcode_entry.bind("<Return>", lambda _e: self.send_gcode())
         self.gcode_entry.bind("<Up>", lambda _e: self.history_move(-1))
         self.gcode_entry.bind("<Down>", lambda _e: self.history_move(1))
-        ttk.Button(terminal, text="Envoyer", command=self.send_gcode).pack(side="left", padx=6)
-        ttk.Button(terminal, text="Effacer", command=self.clear_log).pack(side="left")
+        self.send_button = ttk.Button(terminal, text="Envoyer", style="Send.TButton",
+                                      command=self.send_gcode)
+        self.send_button.pack(side="left", padx=(8, 0))
+
+    def set_console_visible(self, visible):
+        self.logs_visible.set(visible)
+        if visible:
+            self.console_body.pack(fill="x", padx=14, pady=(2, 12))
+        else:
+            self.console_body.pack_forget()
+        self.console_toggle.configure(text="Masquer" if visible else "Afficher")
+
+    def toggle_console(self):
+        self.set_console_visible(not self.logs_visible.get())
 
     def toggle_bottom_area(self):
-        if self.logs_visible.get():
-            self.bottom_body.pack(fill="x", padx=8, pady=(0, 8))
-        else:
-            self.bottom_body.pack_forget()
-        self.root.update_idletasks()
+        self.set_console_visible(self.logs_visible.get())
+
+    def _grip_press(self, event):
+        self._grip = (event.y_root, int(self.log.cget("height")))
+
+    def _grip_drag(self, event):
+        if not self._grip or not self.logs_visible.get():
+            return
+        y0, h0 = self._grip
+        line = max(1, self.f["mono"].metrics("linespace"))
+        height = max(3, min(30, h0 + round((y0 - event.y_root) / line)))
+        if height != int(self.log.cget("height")):
+            self.log.configure(height=height)
 
     # ------------------------------------------------------------------
     # État / connexion
@@ -560,25 +901,38 @@ class EnderGUI:
             except tk.TclError:
                 pass
 
+    def set_status(self, text, kind="idle"):
+        self._status_kind = kind
+        shown = text if len(text) <= 50 else text[:47] + "…"
+        self.status_var.set(shown)
+        self.status_dot.itemconfigure(self._dot, fill=STATUS_COLORS.get(kind, C["faint"]))
+        self.status_label.configure(fg=C["danger"] if kind == "error" else C["muted"])
+
     def update_controls(self):
         idle = self.connected and not self.busy and not self.running
         self.set_enabled(self.w_motion, idle)
+        self.set_enabled(self.w_goto, idle)
+        self.set_enabled([self.capture_button], self.connected and not self.running)
         self.set_enabled(self.w_connection, not self.busy and not self.running)
+        self.set_enabled(self.w_edit, not self.running)
+        self.set_enabled([self.add_point_button], not self.running)
         self.set_enabled([self.run_button], self.connected and idle and len(self.program) > 0)
         self.set_enabled([self.stop_program_button], self.running)
-        self.set_enabled([self.return_button], self.connected and not self.busy and not self.running and self.program_start_position is not None)
+        self.set_enabled([self.return_button], self.connected and not self.busy
+                         and not self.running and self.program_start_position is not None)
         # Les arrêts restent disponibles même pendant une commande, un jog ou un programme.
         self.set_enabled([self.stop_button, self.emergency_button], self.connected)
-        self.connect_button.configure(text="Déconnecter" if self.connected else "Connecter")
+        self.set_enabled([self.gcode_entry, self.send_button], self.connected)
+        self.connect_button.configure(text="Déconnecter" if self.connected else "Connecter",
+                                      style="Soft.TButton" if self.connected else "Accent.TButton")
         if self.running:
-            state = "Programme en cours" + (f" — {self.step_text}" if self.step_text else "")
+            self.set_status("Programme en cours" + (f" — {self.step_text}" if self.step_text else ""), "run")
         elif self.busy:
-            state = "Commande en cours..."
+            self.set_status("Commande en cours…", "busy")
         elif self.connected:
-            state = "Connecté"
+            self.set_status("Connecté", "ok")
         else:
-            state = "Déconnecté"
-        self.status_var.set(state)
+            self.set_status("Déconnecté", "idle")
 
     def set_busy(self, busy):
         self.busy = busy
@@ -619,10 +973,10 @@ class EnderGUI:
     def mark_disconnected(self):
         self.connected = False
         self.printer.last_position = None
-        self.position_var.set("X : --     Y : --     Z : --")
+        for var in self.pos_vars.values():
+            var.set(NO_POSITION)
         self.update_controls()
-        self.draw_3d()
-        self.draw_program_preview()
+        self.request_draw()
 
     # ------------------------------------------------------------------
     # Télécommande continue
@@ -631,50 +985,10 @@ class EnderGUI:
         try:
             speed = int(float(str(self.speed_var.get()).replace(",", ".")))
         except ValueError:
-            raise ValueError("La vitesse doit être un nombre.")
+            raise ValueError("La vitesse doit être un nombre.") from None
         if speed < 1 or speed > config.MAX_SPEED:
             raise ValueError(f"La vitesse doit être comprise entre 1 et {config.MAX_SPEED} mm/min.")
         return speed
-
-    # API de compatibilité : déplacement discret utilisé par les anciens
-    # scripts/tests. L'interface actuelle privilégie le jog continu.
-    def move(self, axis, direction):
-        if not self.connected or self.busy or self.running or self.jogging:
-            return
-        try:
-            distance = float(self.step_var.get()) * direction
-            speed = self.get_speed()
-            axis = axis.upper()
-            if axis not in "XYZ":
-                raise ValueError(f"Axe invalide : {axis}")
-            if self.printer.last_position is not None:
-                target = self.printer.last_position[axis] + distance
-                low, high = config.AXIS_LIMITS[axis]
-                if not low <= target <= high:
-                    message = f"{axis} = {target:g} mm hors limites ({low:g} à {high:g} mm)."
-                    self.write_log(f"ERREUR : {message}")
-                    self.status_var.set(f"Erreur : {message}")
-                    return
-        except ValueError as exc:
-            self.write_log(f"ERREUR : {exc}")
-            self.status_var.set(f"Erreur : {exc}")
-            return
-        self.run_async(lambda: self.printer.move_relative(axis, distance, speed), lambda _: self.show_position(self.printer.last_position))
-
-    def goto(self):
-        if not self.connected or self.busy or self.running:
-            return
-        try:
-            x = parse_float(self.goto_vars["X"].get(), "X")
-            y = parse_float(self.goto_vars["Y"].get(), "Y")
-            z = parse_float(self.goto_vars["Z"].get(), "Z")
-            speed = self.get_speed()
-            self.printer.check_target({"X": x, "Y": y, "Z": z})
-        except (ValueError, PrinterError) as exc:
-            self.write_log(f"ERREUR : {exc}")
-            self.status_var.set(f"Erreur : {exc}")
-            return
-        self.run_async(lambda: self.printer.move_absolute(x, y, z, speed), lambda _: self.show_position(self.printer.last_position))
 
     def start_jog(self, axis, direction):
         if not self.connected or self.running or self.busy or self.jogging:
@@ -683,6 +997,7 @@ class EnderGUI:
             speed = self.get_speed()
         except ValueError as exc:
             self.write_log(f"ERREUR : {exc}")
+            self.set_status(f"Erreur : {exc}", "error")
             return
         self.jogging = True
         self.jog_axis = axis
@@ -739,8 +1054,7 @@ class EnderGUI:
         self.jog_direction = 0
         self._jog_started = False
         self.update_controls()
-        # jog_stop() a déjà récupéré M114 sans M400. Aucun second relevé
-        # différé ne doit recréer un temps d'attente après le relâchement.
+        # jog_stop() a déjà récupéré M114 sans M400 : pas de second relevé.
         if self.connected and self.printer.last_position:
             self.show_position(self.printer.last_position)
 
@@ -756,16 +1070,18 @@ class EnderGUI:
             self.write_log(f"ERREUR STOP JOG : {exc}")
 
     def home(self):
-        """HOME utilisateur : déplacement absolu vers X0 Y0 Z0."""
+        """Déplacement absolu vers X0 Y0 Z0."""
         if not self.connected or self.busy or self.running:
             return
         try:
             speed = self.get_speed()
         except ValueError as exc:
             self.write_log(f"ERREUR : {exc}")
+            self.set_status(f"Erreur : {exc}", "error")
             return
         self.write_log("HOME : déplacement vers X0 Y0 Z0")
-        self.run_async(lambda: self.printer.move_absolute(0, 0, 0, speed), lambda _: self.show_position(self.printer.last_position))
+        self.run_async(lambda: self.printer.move_absolute(0, 0, 0, speed),
+                       lambda _: self.show_position(self.printer.last_position))
 
     def recalibrate(self):
         """Référencement mécanique de l'imprimante (G28)."""
@@ -777,17 +1093,11 @@ class EnderGUI:
     def show_position(self, position):
         if not position:
             return
-        self.position_var.set(f"X : {position['X']:g} mm     Y : {position['Y']:g} mm     Z : {position['Z']:g} mm")
-        self.draw_3d()
-        self.draw_program_preview()
+        for axis in "XYZ":
+            self.pos_vars[axis].set(f"{position[axis]:g}")
+        self.request_draw()
 
     def get_position(self):
-        if not self.connected:
-            return
-        self.run_async(self.printer.get_position, self.show_position, busy=False)
-
-    def refresh_position_periodically(self):
-        """Compatibilité : relevé manuel unique, sans boucle automatique."""
         if not self.connected:
             return
         self.run_async(self.printer.get_position, self.show_position, busy=False)
@@ -826,22 +1136,16 @@ class EnderGUI:
             self.stop_program()
             self.write_log("STOP : programme interrompu (M410).")
             return
-        try:
-            self.printer.quick_stop()
-            self.write_log("STOP : mouvements interrompus (M410).")
-            self._refresh_position_after_stop()
-        except Exception as exc:
-            self.write_log(f"ERREUR STOP : {exc}")
 
-    def _refresh_position_after_stop(self):
-        """Attend uniquement que la commande interrompue libère le port, puis M114."""
         def worker():
-            for _ in range(40):
-                position = self.printer.poll_position()
-                if position is not None:
+            try:
+                position = self.printer.quick_stop()
+                self.post(self.write_log, "STOP : mouvements interrompus (M410).")
+                if position:
                     self.post(self.show_position, position)
-                    return
-                time.sleep(0.05)
+            except Exception as exc:
+                self.post(self.write_log, f"ERREUR STOP : {exc}")
+
         threading.Thread(target=worker, daemon=True).start()
 
     def emergency_stop(self):
@@ -859,13 +1163,21 @@ class EnderGUI:
         finally:
             self.mark_disconnected()
             self.running = False
+            self.update_controls()
         self.write_log("ARRÊT D'URGENCE exécuté. Redémarrer l'imprimante avant reconnexion.")
 
     # ------------------------------------------------------------------
-    # Points
+    # Point
     # ------------------------------------------------------------------
+    def _read_point(self):
+        """Retourne (x, y, z) du point édité, ou lève ValueError."""
+        values = [parse_float(self.point_vars[a].get(), a) for a in "XYZ"]
+        if any(v is None for v in values):
+            raise ValueError("Les trois coordonnées sont obligatoires.")
+        return tuple(values)
+
     def change_point_axis(self, axis, direction):
-        """Incrémente une coordonnée du point de travail avec le pas choisi."""
+        """Incrémente une coordonnée du point avec le pas choisi."""
         try:
             step = parse_float(self.point_step_var.get(), "pas")
             if step is None or step <= 0:
@@ -873,29 +1185,10 @@ class EnderGUI:
             value = parse_float(self.point_vars[axis].get(), axis)
             if value is None:
                 value = 0.0
-            value += direction * step
-            self.point_vars[axis].set(f"{value:g}")
-            self.draw_3d()
+            self.point_vars[axis].set(f"{value + direction * step:g}")
+            self.request_draw()
         except ValueError as exc:
             messagebox.showwarning("Point", str(exc))
-
-    def _point_values_from_tree(self, iid):
-        values = self.points_tree.item(iid, "values")
-        return tuple(parse_float(v, a) for a, v in zip("XYZ", values[1:4]))
-
-    def _point_items(self):
-        return self.points_tree.get_children()
-
-    # Compatibilité interne pour les acquisitions : l'interface n'expose plus
-    # une liste de points.
-    def previous_point(self):
-        return
-
-    def next_point(self):
-        return
-
-    def new_point(self):
-        return
 
     def capture_point(self):
         if not self.connected or not self.printer.last_position:
@@ -904,176 +1197,284 @@ class EnderGUI:
         p = self.printer.last_position
         for axis in "XYZ":
             self.point_vars[axis].set(f"{p[axis]:g}")
-        self.draw_3d()
-
-    def add_point_values(self, x, y, z):
-        # Conserve les points issus de l'acquisition pour compatibilité/export,
-        # sans transformer l'éditeur de point en liste utilisateur.
-        index = len(self._point_items()) + 1
-        self.points_tree.insert("", "end", values=(f"P{index}", f"{x:g}", f"{y:g}", f"{z:g}"))
-
-    def apply_point(self):
-        try:
-            values = [parse_float(self.point_vars[a].get(), a) for a in "XYZ"]
-            if any(v is None for v in values):
-                raise ValueError("Les trois coordonnées sont obligatoires.")
-            self.draw_3d()
-        except ValueError as exc:
-            messagebox.showwarning("Point", str(exc))
-
-    def point_selected(self, _event=None):
-        self.draw_3d()
-
-    def delete_selected_point(self):
-        # Conservé pour compatibilité, volontairement inutilisé dans l'interface.
-        return
+        self.request_draw()
 
     def goto_selected_point(self):
         if not self.connected or self.busy or self.running:
             return
         try:
-            x, y, z = (parse_float(self.point_vars[a].get(), a) for a in "XYZ")
-            if None in (x, y, z):
-                raise ValueError("Les trois coordonnées sont obligatoires.")
+            x, y, z = self._read_point()
             speed = self.get_speed()
             self.printer.check_target({"X": x, "Y": y, "Z": z})
         except (ValueError, PrinterError) as exc:
             messagebox.showwarning("Point", str(exc))
             return
-        self.run_async(lambda: self.printer.move_absolute(x, y, z, speed), lambda _: self.show_position(self.printer.last_position))
+        self.run_async(lambda: self.printer.move_absolute(x, y, z, speed),
+                       lambda _: self.show_position(self.printer.last_position))
 
     def add_selected_to_program(self):
+        if self.running:
+            return
         try:
-            x, y, z = (parse_float(self.point_vars[a].get(), a) for a in "XYZ")
-            if None in (x, y, z):
-                raise ValueError("Les trois coordonnées sont obligatoires.")
-            wp = Waypoint(x=x, y=y, z=z, vitesse=self.get_speed() if self.connected else config.DEFAULT_SPEED)
+            x, y, z = self._read_point()
+            wp = Waypoint(x=x, y=y, z=z, vitesse=self.get_speed())
         except (ValueError, ProgramError) as exc:
             messagebox.showwarning("Programme", str(exc))
             return
         self.program.add(wp)
         self.refresh_program_tree()
-        self.draw_program_preview()
+        self.select_program_row(len(self.program) - 1)
 
     # ------------------------------------------------------------------
-    # Caméras 3D
+    # Vue 3D
     # ------------------------------------------------------------------
-    def _camera(self, kind=None):
-        # Une seule caméra pour les deux vues : X, Y, Z et les gestes restent
-        # strictement identiques entre le schéma des points et celui du programme.
-        return (self.view_yaw, self.view_pitch, self.view_zoom, self.view_pan_x, self.view_pan_y)
+    def reset_camera(self, redraw=True):
+        self.view_yaw = 0.68 + math.pi
+        self.view_pitch = 0.52
+        self.view_zoom = 1.0
+        self.view_pan_x = 0.0
+        self.view_pan_y = 0.0
+        if redraw:
+            self.request_draw()
 
-    def _set_camera(self, kind, values):
-        self.view_yaw, self.view_pitch, self.view_zoom, self.view_pan_x, self.view_pan_y = values
-        # Les deux vues partagent la même caméra et doivent se rafraîchir
-        # immédiatement, même lorsque l'utilisateur agit sur une seule vue.
-        if hasattr(self, "canvas3d"):
-            self.draw_3d()
-        if hasattr(self, "program_canvas"):
-            self.draw_program_preview()
+    def _view_press(self, event, mode):
+        self.view_drag = (event.x, event.y, self.view_yaw, self.view_pitch,
+                          self.view_pan_x, self.view_pan_y, mode)
 
-    def _view_press(self, kind, event, mode):
-        yaw, pitch, zoom, panx, pany = self._camera(kind)
-        self.view_drag = (kind, event.x, event.y, yaw, pitch, panx, pany, mode)
-
-    def _view_drag(self, kind, event, mode):
-        if not self.view_drag or self.view_drag[0] != kind:
+    def _view_drag(self, event):
+        if not self.view_drag:
             return
-        _, x0, y0, yaw, pitch, panx, pany, start_mode = self.view_drag
-        mode = start_mode
+        x0, y0, yaw, pitch, panx, pany, mode = self.view_drag
         if mode == "rotate":
-            # Rotation naturelle de la caméra : tirer la souris vers la droite
-            # fait pivoter la vue vers la droite (sens inverse du déplacement
-            # angulaire interne). Même convention sur les deux vues.
-            yaw -= (event.x - x0) * 0.012
-            pitch = max(-1.35, min(1.35, pitch + (event.y - y0) * 0.012))
+            self.view_yaw = yaw - (event.x - x0) * 0.012
+            self.view_pitch = max(-1.35, min(1.35, pitch + (event.y - y0) * 0.012))
         else:
-            # Pan direct : la scène suit le déplacement de la souris.
-            # Tirer vers la droite déplace donc le schéma vers la droite.
-            panx += (event.x - x0) * 0.9
-            pany += (event.y - y0) * 0.9
-        self._set_camera(kind, (yaw, pitch, self._camera(kind)[2], panx, pany))
+            self.view_pan_x = panx + (event.x - x0)
+            self.view_pan_y = pany + (event.y - y0)
+        self.request_draw()
 
-    def _view_zoom_event(self, kind, event):
-        self._zoom(kind, 1.1 if event.delta > 0 else 0.9)
+    def _zoom(self, factor):
+        self.view_zoom = max(0.25, min(5.0, self.view_zoom * factor))
+        self.request_draw()
 
-    def _zoom(self, kind, factor):
-        cam = list(self._camera(kind))
-        cam[2] = max(0.25, min(5.0, cam[2] * factor))
-        self._set_camera(kind, cam)
+    @staticmethod
+    def _bounds():
+        lim = config.AXIS_LIMITS
+        return (*lim["X"], *lim["Y"], *lim["Z"])
 
-    def _project(self, x, y, z, width, height, kind="points", bounds=(0, 220, 0, 220, 0, 250)):
-        yaw, pitch, zoom, panx, pany = self._camera(kind)
+    def _project(self, x, y, z, width, height, bounds):
         xmin, xmax, ymin, ymax, zmin, zmax = bounds
-        cx, cy, cz = (xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2
-        x -= cx
-        y -= cy
-        z -= cz
+        x -= (xmin + xmax) / 2
+        y -= (ymin + ymax) / 2
+        z -= (zmin + zmax) / 2
+        cyaw, syaw = math.cos(self.view_yaw), math.sin(self.view_yaw)
+        cp, sp = math.cos(self.view_pitch), math.sin(self.view_pitch)
         # Représentation graphique : X et Y sont échangés volontairement.
-        # Cela ne change jamais les coordonnées envoyées à l'imprimante.
-        cyaw, syaw = math.cos(yaw), math.sin(yaw)
-        cp, sp = math.cos(pitch), math.sin(pitch)
-
-        # Rotation horizontale autour de Z, après échange graphique X <-> Y.
         graph_x, graph_y = y, x
         screen_x = graph_x * cyaw - graph_y * syaw
         depth = graph_x * syaw + graph_y * cyaw
-
-        # Inclinaison de la caméra : Z reste positif vers le haut.
         screen_up = z * cp - depth * sp
+        radius = 0.5 * math.sqrt((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2)
+        scale = (min(width, height) / 2 - 30) / radius * 1.12 * self.view_zoom
+        return (width / 2 + screen_x * scale + self.view_pan_x,
+                height / 2 - screen_up * scale + self.view_pan_y)
 
-        span = max(xmax - xmin, ymax - ymin, zmax - zmin)
-        scale = min(width, height) / (span * 1.55) * zoom
-        return width / 2 + screen_x * scale + panx, height / 2 - screen_up * scale + pany
+    def request_draw(self):
+        if self._draw_job is None:
+            self._draw_job = self.root.after(15, self.draw_scene)
 
-    def _draw_cube(self, canvas, width, height, kind, bounds=(0, 220, 0, 220, 0, 250)):
-        xmin, xmax, ymin, ymax, zmin, zmax = bounds
-        corners = [(x, y, z) for z in (zmin, zmax) for y in (ymin, ymax) for x in (xmin, xmax)]
-        # index = z*4 + y*2 + x
-        edges = [(0,1),(0,2),(1,3),(2,3),(4,5),(4,6),(5,7),(6,7),(0,4),(1,5),(2,6),(3,7)]
-        projected = [self._project(*p, width, height, kind, bounds) for p in corners]
-        for a, b in edges:
-            canvas.create_line(*projected[a], *projected[b], fill="#b9bdc2")
-        # Origine du repère sur le coin bas/avant du volume. X et Y suivent
-        # ici des directions graphiques échangées.
-        origin = self._project(xmin, ymin, zmin, width, height, kind, bounds)
-        axis_specs = [
-            ((xmin + (xmax - xmin) * 0.25, ymin, zmin), "X"),
-            ((xmin, ymin + (ymax - ymin) * 0.25, zmin), "Y"),
-            ((xmin, ymin, zmin + (zmax - zmin) * 0.25), "Z"),
-        ]
-        for end, label in axis_specs:
-            p = self._project(*end, width, height, kind, bounds)
-            canvas.create_line(*origin, *p, fill="#6f7479", width=2, arrow=tk.LAST)
-            canvas.create_text(p[0] + 8, p[1], text=label, fill="#44484d", anchor="w", font=("TkDefaultFont", 9, "bold"))
+    @staticmethod
+    def _label(c, x, y, text, anchor, fill, font):
+        """Texte avec halo blanc pour rester lisible par-dessus le schéma."""
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)):
+            c.create_text(x + dx, y + dy, text=text, anchor=anchor, fill=C["surface"], font=font)
+        c.create_text(x, y, text=text, anchor=anchor, fill=fill, font=font)
 
-    def draw_3d(self):
-        if not hasattr(self, "canvas3d"):
-            return
-        c = self.canvas3d
+    def _marker(self, c, P, p, floor_z, color, kind="ring", label=None, label_color=None,
+                below=False):
+        x, y, z = p
+        top = P(x, y, z)
+        c.create_line(*top, *P(x, y, floor_z), fill=C["faint"], dash=(2, 3))
+        if kind == "ring":
+            c.create_oval(top[0] - 8, top[1] - 8, top[0] + 8, top[1] + 8, outline=color, width=2)
+            c.create_oval(top[0] - 3, top[1] - 3, top[0] + 3, top[1] + 3, fill=color, outline="")
+        elif kind == "diamond":
+            c.create_polygon(top[0], top[1] - 7, top[0] + 7, top[1], top[0], top[1] + 7,
+                             top[0] - 7, top[1], fill=color, outline="white", width=1)
+        else:  # square
+            c.create_rectangle(top[0] - 5, top[1] - 5, top[0] + 5, top[1] + 5,
+                               outline=color, width=2)
+        if label:
+            if below:
+                self._label(c, top[0] + 12, top[1] + 8, label, "nw", label_color or color,
+                            self.f["small"])
+            else:
+                self._label(c, top[0] + 12, top[1] - 8, label, "sw", label_color or color,
+                            self.f["small"])
+
+    def draw_scene(self):
+        self._draw_job = None
+        c = self.view
         c.delete("all")
-        w, h = max(c.winfo_width(), 360), max(c.winfo_height(), 220)
-        bounds = (0, 220, 0, 220, 0, 250)
-        self._draw_cube(c, w, h, "points", bounds)
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 80 or h < 80:
+            return
+        b = self._bounds()
+        xmin, xmax, ymin, ymax, zmin, zmax = b
+
+        def P(x, y, z):
+            return self._project(x, y, z, w, h, b)
+
+        # Sol (grille)
+        n = 4
+        for i in range(n + 1):
+            t = i / n
+            y = ymin + (ymax - ymin) * t
+            x = xmin + (xmax - xmin) * t
+            c.create_line(*P(xmin, y, zmin), *P(xmax, y, zmin), fill=C["grid"])
+            c.create_line(*P(x, ymin, zmin), *P(x, ymax, zmin), fill=C["grid"])
+
+        # Volume de travail
+        corners = {(i, j, k): P(xmax if i else xmin, ymax if j else ymin, zmax if k else zmin)
+                   for i in (0, 1) for j in (0, 1) for k in (0, 1)}
+        for (i, j, k), p in corners.items():
+            for di, dj, dk in ((1, 0, 0), (0, 1, 0), (0, 0, 1)):
+                q = (i + di, j + dj, k + dk)
+                if q in corners:
+                    color = C["edge"] if k == 0 and dk == 0 else C["grid"]
+                    c.create_line(*p, *corners[q], fill=color, width=1)
+
+        # Axes à l'origine
+        origin = P(xmin, ymin, zmin)
+        for end, label, color in (((xmin + (xmax - xmin) * 0.25, ymin, zmin), "X", C["axis_x"]),
+                                  ((xmin, ymin + (ymax - ymin) * 0.25, zmin), "Y", C["axis_y"]),
+                                  ((xmin, ymin, zmin + (zmax - zmin) * 0.25), "Z", C["axis_z"])):
+            p = P(*end)
+            c.create_line(*origin, *p, fill=color, width=2, arrow=tk.LAST)
+            self._label(c, p[0] + 8, p[1], label, "w", color, self.f["bold"])
+
+        # Trajectoire du programme
+        selection = self.program_tree.selection()
+        selected = self.program_tree.index(selection[0]) if selection else None
+        pts = []
+        for i, wp in enumerate(self.program):
+            if wp.x is None or wp.y is None or wp.z is None:
+                continue
+            pts.append((i, P(wp.x, wp.y, wp.z)))
+        for a, b2 in zip(pts, pts[1:]):
+            c.create_line(*a[1], *b2[1], fill=C["path"], width=2, capstyle="round")
+        for i, xy in pts:
+            if self.running and i == self.current_step:
+                c.create_oval(xy[0] - 10, xy[1] - 10, xy[0] + 10, xy[1] + 10,
+                              outline=C["ok"], width=2)
+            if i == selected:
+                c.create_oval(xy[0] - 7, xy[1] - 7, xy[0] + 7, xy[1] + 7,
+                              fill=C["accent"], outline="white", width=2)
+                color = C["accent"]
+            else:
+                c.create_oval(xy[0] - 4, xy[1] - 4, xy[0] + 4, xy[1] + 4,
+                              fill="#4a5160", outline="white")
+                color = C["muted"]
+            self._label(c, xy[0] - 8, xy[1] - 7, str(i + 1), "se", color,
+                        self.f["bold"] if i == selected else self.f["small"])
+
+        if self.program_start_position:
+            p = self.program_start_position
+            self._marker(c, P, (p["X"], p["Y"], p["Z"]), zmin, C["ok"], "square", "Départ",
+                         below=True)
+
         try:
-            x, y, z = (parse_float(self.point_vars[a].get(), a) for a in "XYZ")
-            if None in (x, y, z):
-                raise ValueError
-            xy = self._project(x, y, z, w, h, "points", bounds)
-            c.create_oval(xy[0]-4, xy[1]-4, xy[0]+4, xy[1]+4, fill="#202326", outline="")
-            c.create_text(xy[0]+12, xy[1]-10, text=f"({x:g}, {y:g}, {z:g})", anchor="sw", fill="#202326", font=("TkDefaultFont", 9, "bold"))
+            x, y, z = self._read_point()
+            self._marker(c, P, (x, y, z), zmin, C["warn"], "diamond",
+                         f"({x:g}, {y:g}, {z:g})", C["text"])
         except ValueError:
             pass
+
         if self.printer.last_position:
             p = self.printer.last_position
-            xy = self._project(p["X"], p["Y"], p["Z"], w, h, "points", bounds)
-            c.create_oval(xy[0]-5, xy[1]-5, xy[0]+5, xy[1]+5, outline="#1f4f7a", width=2)
-            c.create_text(xy[0]+9, xy[1]+9, text="Machine", anchor="nw", fill="#1f4f7a")
-        c.create_text(12, 12, text="Glisser : rotation    Maj + glisser : déplacement    Molette : zoom", anchor="nw", fill="#5c6268")
+            self._marker(c, P, (p["X"], p["Y"], p["Z"]), zmin, C["accent"], "ring", "Machine",
+                         below=True)
+
+        # Légende + aide
+        lx, ly = 16, 18
+        for text, color in (("Machine", C["accent"]), ("Point", C["warn"]),
+                            ("Programme", "#4a5160")):
+            c.create_oval(lx, ly - 4, lx + 8, ly + 4, fill=color, outline="")
+            item = c.create_text(lx + 14, ly, text=text, anchor="w", fill=C["muted"],
+                                 font=self.f["small"])
+            lx = c.bbox(item)[2] + 16
+        c.create_text(16, h - 14, anchor="w", fill=C["faint"], font=self.f["small"],
+                      text="Glisser : pivoter    Maj + glisser : déplacer    Molette : zoom")
 
     # ------------------------------------------------------------------
-    # Programmes
+    # Programme
     # ------------------------------------------------------------------
+    def _sync_program_name(self):
+        self.program.name = self.program_name_var.get().strip() or "Sans titre"
+
+    def _row_tags(self, wp, active=False):
+        tags = []
+        if wp.x is None or wp.y is None or wp.z is None:
+            tags.append("incomplete")
+        if active:
+            tags.append("active")
+        return tuple(tags)
+
+    def select_program_row(self, index, copy=False):
+        """Sélectionne une ligne. `copy` recopie ses valeurs dans l'éditeur de point."""
+        items = self.program_tree.get_children()
+        if not items:
+            return
+        index = max(0, min(index, len(items) - 1))
+        self._last_selected = None if copy else index
+        self.program_tree.selection_set(items[index])
+        self.program_tree.see(items[index])
+
+    def refresh_program_tree(self):
+        if not hasattr(self, "program_tree"):
+            return
+        selection = self.program_tree.selection()
+        previous = self.program_tree.index(selection[0]) if selection else None
+        self._sync_program_name()
+        self.program_tree.delete(*self.program_tree.get_children())
+        for i, wp in enumerate(self.program, start=1):
+            self.program_tree.insert(
+                "", "end", tags=self._row_tags(wp, self.running and i - 1 == self.current_step),
+                values=(i, fmt(wp.x), fmt(wp.y), fmt(wp.z), fmt(wp.vitesse), fmt(wp.attente)))
+        if len(self.program):
+            self.empty_hint.place_forget()
+            if previous is not None:
+                self.select_program_row(previous)
+        else:
+            self._last_selected = None
+            self.empty_hint.place(relx=0.5, rely=0.42, anchor="center")
+        self.request_draw()
+        self.update_controls()
+
+    def program_selected(self, _event=None):
+        selection = self.program_tree.selection()
+        if selection:
+            index = self.program_tree.index(selection[0])
+            if index != self._last_selected and index < len(self.program):
+                self._last_selected = index
+                wp = self.program[index]
+                for axis, value in (("X", wp.x), ("Y", wp.y), ("Z", wp.z)):
+                    self.point_vars[axis].set("" if value is None else f"{value:g}")
+        else:
+            self._last_selected = None
+        self.request_draw()
+
+    def program_menu(self, event):
+        item = self.program_tree.identify_row(event.y)
+        if not item:
+            return
+        self.program_tree.selection_set(item)
+        idle = self.connected and not self.busy and not self.running
+        self.menu.entryconfigure(0, state="normal" if idle else "disabled")
+        for index in (2, 3, 4):
+            self.menu.entryconfigure(index, state="disabled" if self.running else "normal")
+        self.menu.tk_popup(event.x_root, event.y_root)
+
     def edit_program_cell(self, event):
         """Ouvre un petit champ d'édition directement dans une cellule."""
         if self.running:
@@ -1083,9 +1484,7 @@ class EnderGUI:
         item = self.program_tree.identify_row(event.y)
         if region != "cell" or not item or column_id == "#1":
             return
-
-        column_index = int(column_id[1:]) - 1
-        field = ("x", "y", "z", "vitesse", "attente")[column_index - 1]
+        field = PROGRAM_FIELDS[int(column_id[1:]) - 2]
         bbox = self.program_tree.bbox(item, column_id)
         if not bbox:
             return
@@ -1094,7 +1493,7 @@ class EnderGUI:
         wp = self.program[self.program_tree.index(item)]
         value = getattr(wp, field)
         variable = tk.StringVar(value="" if value is None else f"{value:g}")
-        editor = ttk.Entry(self.program_tree, textvariable=variable)
+        editor = ttk.Entry(self.program_tree, textvariable=variable, justify="right")
         editor.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
         self._program_edit_entry = editor
         editor.focus_set()
@@ -1105,11 +1504,11 @@ class EnderGUI:
 
     def update_program_cell_value(self, index, field, text):
         """Modifie une cellule du programme et reconstruit le waypoint."""
-        if field not in ("x", "y", "z", "vitesse", "attente"):
+        if field not in PROGRAM_FIELDS:
             raise ValueError(f"Colonne non modifiable : {field}")
         wp = self.program[index]
-        values = {name: getattr(wp, name) for name in ("x", "y", "z", "vitesse", "attente")}
-        parsed = parse_float(str(text).strip().replace("—", ""), field)
+        values = {name: getattr(wp, name) for name in PROGRAM_FIELDS}
+        parsed = parse_float(str(text).strip().replace(NO_POSITION, ""), field)
         if field == "attente" and parsed is None:
             parsed = 0.0
         values[field] = parsed
@@ -1130,101 +1529,68 @@ class EnderGUI:
             index = self.program_tree.index(item)
             self.update_program_cell_value(index, field, variable.get())
             self.refresh_program_tree()
-            items = self.program_tree.get_children()
-            if items:
-                self.program_tree.selection_set(items[index])
+            self.select_program_row(index, copy=True)
         except (ValueError, ProgramError, tk.TclError) as exc:
             messagebox.showwarning("Programme", str(exc))
-
-    def refresh_program_tree(self):
-        if not hasattr(self, "program_tree"):
-            return
-        self.program_tree.delete(*self.program_tree.get_children())
-        self.program.name = self.program_name_var.get().strip() or "Sans titre"
-        for i, wp in enumerate(self.program, start=1):
-            self.program_tree.insert("", "end", values=(i, fmt(wp.x), fmt(wp.y), fmt(wp.z), fmt(wp.vitesse), fmt(wp.attente)))
-        self.draw_program_preview()
-        self.update_controls()
-
-    def program_selected(self, _event=None):
-        selection = self.program_tree.selection()
-        if selection:
-            index = self.program_tree.index(selection[0])
-            wp = self.program[index]
-            for axis, value in (("X", wp.x), ("Y", wp.y), ("Z", wp.z)):
-                self.point_vars[axis].set("" if value is None else f"{value:g}")
-        self.draw_3d()
-        self.draw_program_preview()
 
     def goto_program_selected(self):
         selection = self.program_tree.selection()
         if not selection or not self.connected or self.busy or self.running:
             return
-        index = self.program_tree.index(selection[0])
-        wp = self.program[index]
+        wp = self.program[self.program_tree.index(selection[0])]
         try:
+            if wp.x is None and wp.y is None and wp.z is None:
+                raise ValueError("Cette ligne est vide.")
             speed = self.get_speed()
-            self.run_async(lambda: self.printer.move_absolute(wp.x, wp.y, wp.z, speed), lambda _: self.show_position(self.printer.last_position))
-        except ValueError as exc:
+            self.printer.check_target({"X": wp.x, "Y": wp.y, "Z": wp.z})
+        except (ValueError, PrinterError) as exc:
             messagebox.showwarning("Programme", str(exc))
-
-    def add_current_to_program(self):
-        if not self.printer.last_position:
-            messagebox.showinfo("Programme", "Aucune position machine connue. Cette action nécessite une connexion.")
             return
-        p = self.printer.last_position
-        self.program.add(Waypoint(x=p["X"], y=p["Y"], z=p["Z"], vitesse=self.get_speed()))
-        self.refresh_program_tree()
+        self.run_async(lambda: self.printer.move_absolute(wp.x, wp.y, wp.z, speed),
+                       lambda _: self.show_position(self.printer.last_position))
 
     def add_empty_program_point(self):
         """Ajoute une ligne vide qui pourra être remplie ultérieurement."""
-        try:
-            self.program.add(Waypoint())
-        except ProgramError as exc:
-            messagebox.showwarning("Programme", str(exc))
+        if self.running:
             return
+        self.program.add(Waypoint())
         self.refresh_program_tree()
-        items = self.program_tree.get_children()
-        if items:
-            self.program_tree.selection_set(items[-1])
-            self.program_tree.see(items[-1])
-            self.program_selected()
+        self.select_program_row(len(self.program) - 1, copy=True)
 
     def fill_selected_program_point(self):
         selection = self.program_tree.selection()
         if not selection:
-            messagebox.showinfo("Programme", "Sélectionnez d'abord un point à remplir.")
+            messagebox.showinfo("Programme", "Sélectionnez d'abord une ligne à remplir.")
             return
+        index = self.program_tree.index(selection[0])
         try:
-            x, y, z = (parse_float(self.point_vars[a].get(), a) for a in "XYZ")
-            if any(v is None for v in (x, y, z)):
-                raise ValueError("Les trois coordonnées sont obligatoires pour remplir le point.")
-            speed = self.get_speed() if self.connected else config.DEFAULT_SPEED
-            wp = Waypoint(x=x, y=y, z=z, vitesse=speed)
+            x, y, z = self._read_point()
+            wp = Waypoint(x=x, y=y, z=z, vitesse=self.get_speed(),
+                          attente=self.program[index].attente)
         except (ValueError, ProgramError) as exc:
             messagebox.showwarning("Programme", str(exc))
             return
-        self.program.update(self.program_tree.index(selection[0]), wp)
+        self.program.update(index, wp)
         self.refresh_program_tree()
 
     def delete_program_point(self):
         selection = self.program_tree.selection()
-        if not selection:
+        if not selection or self.running:
             return
-        self.program.remove(self.program_tree.index(selection[0]))
+        index = self.program_tree.index(selection[0])
+        self.program.remove(index)
         self.refresh_program_tree()
+        self._last_selected = None
+        self.select_program_row(index)
 
     def move_program_point(self, offset):
         selection = self.program_tree.selection()
-        if not selection:
+        if not selection or self.running:
             return
         index = self.program_tree.index(selection[0])
         new_index = self.program.move(index, offset)
         self.refresh_program_tree()
-        items = self.program_tree.get_children()
-        if items:
-            self.program_tree.selection_set(items[new_index])
-            self.program_tree.see(items[new_index])
+        self.select_program_row(new_index)
 
     def new_program(self):
         if self.running:
@@ -1233,10 +1599,14 @@ class EnderGUI:
         self.program_path = None
         self.program_name_var.set("Sans titre")
         self.progress_var.set("")
+        self.progress_bar.set(0)
         self.refresh_program_tree()
 
     def load_program(self):
-        path = filedialog.askopenfilename(initialdir=config.PROGRAMS_DIR, filetypes=[("Programme JSON", "*.json")])
+        if self.running:
+            return
+        path = filedialog.askopenfilename(initialdir=config.PROGRAMS_DIR,
+                                          filetypes=[("Programme JSON", "*.json")])
         if not path:
             return
         try:
@@ -1246,14 +1616,19 @@ class EnderGUI:
             return
         self.program_path = path
         self.program_name_var.set(self.program.name)
+        self.progress_var.set("")
+        self.progress_bar.set(0)
+        self._last_selected = None
         self.refresh_program_tree()
 
     def save_program(self):
-        self.program.name = self.program_name_var.get().strip() or "Sans titre"
+        self._sync_program_name()
         path = self.program_path
         if not path:
             os.makedirs(config.PROGRAMS_DIR, exist_ok=True)
-            path = filedialog.asksaveasfilename(initialdir=config.PROGRAMS_DIR, defaultextension=".json", filetypes=[("Programme JSON", "*.json")])
+            path = filedialog.asksaveasfilename(initialdir=config.PROGRAMS_DIR,
+                                                defaultextension=".json",
+                                                filetypes=[("Programme JSON", "*.json")])
         if not path:
             return
         try:
@@ -1271,56 +1646,63 @@ class EnderGUI:
         if problems:
             messagebox.showwarning("Programme", "\n".join(problems))
             return
-        self.program.name = self.program_name_var.get().strip() or "Sans titre"
+        self._sync_program_name()
         self.program_start_position = dict(self.printer.last_position) if self.printer.last_position else None
         self.running = True
         self.step_text = ""
+        self.current_step = None
+        self.progress_bar.set(0)
         self.update_controls()
         self.write_log(f"Programme lancé : {self.program.name}")
         threading.Thread(target=self._run_program_worker, daemon=True).start()
 
     def _run_program_worker(self):
-        self.runner.run(self.program)
+        try:
+            self.runner.run(self.program)
+        except Exception as exc:
+            self.post(self.run_state_changed, ERROR, str(exc) or exc.__class__.__name__)
+
+    def _mark_active_row(self, index):
+        for i, item in enumerate(self.program_tree.get_children()):
+            if i < len(self.program):
+                self.program_tree.item(item, tags=self._row_tags(self.program[i], i == index))
 
     def step_started(self, index, waypoint):
+        self.current_step = index
+        total = max(1, len(self.program))
         self.step_text = f"Point {index + 1}/{len(self.program)}"
         self.progress_var.set(self.step_text)
-        self.draw_program_preview()
+        self.progress_bar.set(index / total * 100)
+        self._mark_active_row(index)
+        self.program_tree.see(self.program_tree.get_children()[index])
+        self.request_draw()
         self.update_controls()
 
     def runner_reached(self, index, waypoint, position):
         self.show_position(position)
-        # L'acquisition reste masquée dans l'interface, mais le moteur de
-        # mesure continue de pouvoir associer une mesure à chaque point.
-        try:
-            if self.measure_var.get():
-                self.sync_acquisition_parameters()
-                provider = self.acquisition.position_provider
-                self.acquisition.position_provider = lambda p=dict(position): p
-                try:
-                    self.acquisition.measure(index=index)
-                finally:
-                    self.acquisition.position_provider = provider
-                if not any(
-                    abs(float(self.points_tree.item(i, "values")[1]) - position["X"]) < 1e-9 and
-                    abs(float(self.points_tree.item(i, "values")[2]) - position["Y"]) < 1e-9 and
-                    abs(float(self.points_tree.item(i, "values")[3]) - position["Z"]) < 1e-9
-                    for i in self.points_tree.get_children()
-                ):
-                    self.add_point_values(position["X"], position["Y"], position["Z"])
-        except Exception as exc:
-            self.write_log(f"ERREUR ACQUISITION : {exc}")
+        self.progress_bar.set((index + 1) / max(1, len(self.program)) * 100)
+        if self.on_point_reached:
+            try:
+                self.on_point_reached(index, waypoint, position)
+            except Exception as exc:
+                self.write_log(f"ERREUR : {exc}")
 
     def run_state_changed(self, state, message=""):
         if state in (FINISHED, STOPPED, ERROR):
             self.running = False
+            self.current_step = None
+            self._mark_active_row(None)
             if state == FINISHED:
                 self.progress_var.set("Programme terminé")
+                self.progress_bar.set(100)
             elif state == STOPPED:
                 self.progress_var.set("Programme stoppé")
+                if self.printer.last_position:
+                    self.show_position(self.printer.last_position)
             else:
                 self.progress_var.set(f"Erreur : {message}")
             self.write_log(f"Programme : {state}" + (f" — {message}" if message else ""))
+            self.request_draw()
         self.update_controls()
 
     def stop_program(self):
@@ -1333,54 +1715,13 @@ class EnderGUI:
         if not self.connected or self.busy or self.running or not self.program_start_position:
             return
         p = self.program_start_position
-        self.run_async(lambda: self.printer.move_absolute(p["X"], p["Y"], p["Z"], self.get_speed()), lambda _: self.show_position(self.printer.last_position))
-
-    def draw_program_preview(self):
-        if not hasattr(self, "program_canvas"):
-            return
-        c = self.program_canvas
-        c.delete("all")
-        w, h = max(c.winfo_width(), 300), max(c.winfo_height(), 300)
-        bounds = (0, 220, 0, 220, 0, 250)
-        self._draw_cube(c, w, h, "program", bounds)
-        points = []
-        for i, wp in enumerate(self.program, start=1):
-            if wp.x is None or wp.y is None or wp.z is None:
-                continue
-            xy = self._project(wp.x, wp.y, wp.z, w, h, "program", bounds)
-            points.append((i, xy))
-        for a, b in zip(points, points[1:]):
-            c.create_line(*a[1], *b[1], fill="#40454a", width=3)
-        selected = self.program_tree.selection() if hasattr(self, "program_tree") else ()
-        selected_index = self.program_tree.index(selected[0]) + 1 if selected else None
-        for i, xy in points:
-            r = 7 if i == selected_index else 5
-            c.create_oval(xy[0]-r, xy[1]-r, xy[0]+r, xy[1]+r, fill="#202326" if i == selected_index else "#666b70", outline="")
-            c.create_text(xy[0]+10, xy[1]-9, text=f"P{i}", anchor="sw", fill="#34383d")
-        if self.program_start_position:
-            p = self.program_start_position
-            xy = self._project(p["X"], p["Y"], p["Z"], w, h, "program", bounds)
-            c.create_oval(xy[0]-5, xy[1]-5, xy[0]+5, xy[1]+5, outline="#1f4f7a", width=2)
-            c.create_text(xy[0]+9, xy[1]+9, text="Départ", anchor="nw", fill="#1f4f7a")
-        c.create_text(12, 12, text="Trajectoire XYZ — glisser : rotation    Maj + glisser : déplacement", anchor="nw", fill="#5c6268")
-
-    # ------------------------------------------------------------------
-    # Acquisition masquée / compatibilité
-    # ------------------------------------------------------------------
-    def sync_acquisition_parameters(self):
         try:
-            self.acquisition.sample_rate = float(str(self.rate_var.get()).replace(",", "."))
-            self.acquisition.average_samples = max(1, int(self.average_var.get()))
-            return True
-        except (ValueError, TypeError):
-            return False
-
-    def toggle_continuous(self):
-        if self.acquisition.is_running:
-            self.acquisition.stop()
-        else:
-            self.sync_acquisition_parameters()
-            self.acquisition.start()
+            speed = self.get_speed()
+        except ValueError as exc:
+            messagebox.showwarning("Programme", str(exc))
+            return
+        self.run_async(lambda: self.printer.move_absolute(p["X"], p["Y"], p["Z"], speed),
+                       lambda _: self.show_position(self.printer.last_position))
 
     # ------------------------------------------------------------------
     # Logs
@@ -1391,27 +1732,27 @@ class EnderGUI:
         elif getattr(event, "num", None) == 5:
             units = 3
         else:
-            delta = getattr(event, "delta", 0)
-            units = -3 if delta > 0 else 3
+            units = -3 if getattr(event, "delta", 0) > 0 else 3
         self.log.yview_scroll(units, "units")
         return "break"
-
-    def apply_log_height(self):
-        try:
-            height = max(3, min(30, int(self.log_height_var.get())))
-        except (TypeError, ValueError, tk.TclError):
-            height = 7
-        self.log_height_var.set(height)
-        if hasattr(self, "log"):
-            self.log.configure(height=height)
-        self.root.update_idletasks()
 
     def write_log(self, text):
         if not hasattr(self, "log"):
             return
-        stamp = time.strftime("%H:%M:%S")
+        upper = text.upper()
+        if text.startswith(">"):
+            tag = "tx"
+        elif text.startswith("<"):
+            tag = "rx"
+        elif upper.startswith("ERREUR") or "ERREUR" in upper[:24]:
+            tag = "err"
+        elif upper.startswith(("STOP", "ARRÊT")):
+            tag = "warn"
+        else:
+            tag = "info"
         self.log.configure(state="normal")
-        self.log.insert("end", f"{stamp}  {text}\n")
+        self.log.insert("end", time.strftime("%H:%M:%S") + "  ", "stamp")
+        self.log.insert("end", text + "\n", tag)
         lines = int(self.log.index("end-1c").split(".")[0])
         if lines > 2500:
             self.log.delete("1.0", f"{lines - 2500 + 1}.0")

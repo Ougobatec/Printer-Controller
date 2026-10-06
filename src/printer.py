@@ -5,6 +5,7 @@ import time
 
 import config
 import gcode
+import motion
 
 
 class PrinterError(Exception):
@@ -76,6 +77,11 @@ class Printer:
         self.last_position = None
         self.homed = False
 
+        # Suivi de trajectoire (motion.MotionTracker) : alimenté à chaque
+        # déplacement pour connaître la position de la tête PENDANT le
+        # mouvement sans interroger le firmware.
+        self.motion = None
+
         # Appelé avec ("TX" | "RX", texte) pour chaque ligne échangée.
         # Attention : appelé depuis le thread qui envoie la commande.
         self.on_traffic = None
@@ -131,6 +137,8 @@ class Printer:
 
         self.last_position = None
         self.homed = False
+        if self.motion:
+            self.motion.reset()
 
     def is_connected(self):
 
@@ -292,7 +300,10 @@ class Printer:
             raise PrinterError(f"Axe invalide : {axis!r}")
         self._check_speed(speed)
         with self.jog_lock:
+            p0 = dict(self.last_position) if self.last_position else None
             self._write_raw(f"G1 {axis}{distance:g} F{gcode._speed(speed):g}")
+            if self.motion and p0:
+                self.motion.start(p0, {axis: p0[axis] + distance}, gcode._speed(speed))
 
     def _send_raw_and_wait_ok(self, command, timeout=2.0):
         """Envoie une commande hors command_lock et attend son ``ok``."""
@@ -360,6 +371,8 @@ class Printer:
             if not self.is_connected():
                 return None
             self._abort.set()
+            if self.motion:
+                self.motion.abort()
             try:
                 # M410 doit être confirmé avant d'interroger M114 : sinon le
                 # firmware peut encore être occupé et ignorer/reporter plus
@@ -367,9 +380,14 @@ class Printer:
                 self._send_raw_and_wait_ok(gcode.quick_stop(), timeout=5.0)
                 self._send_raw_and_wait_ok("G90", timeout=2.0)
                 self._abort.clear()
-                return self._send_m114_and_wait(timeout=3.0)
+                position = self._send_m114_and_wait(timeout=3.0)
+                if self.motion:
+                    self.motion.settle(position)
+                return position
             except Exception:
                 self._abort.clear()
+                if self.motion:
+                    self.motion.settle(self.last_position)
                 return self.last_position
 
     # -------------------------------------------------
@@ -386,6 +404,8 @@ class Printer:
         # actuellement bloquée dans une lecture série.
         self._abort.set()
         self._write_raw(gcode.quick_stop())
+        if self.motion:
+            self.motion.abort()
 
         # L'ancienne commande doit avoir libéré le lecteur série avant que
         # cette méthode ne lise G90/M114.
@@ -398,10 +418,15 @@ class Printer:
                 self._send_command_locked("G90", timeout=2.0)
 
                 # Une seule lecture de position après l'arrêt effectif.
-                return self._send_m114_and_wait(timeout=3.0)
+                position = self._send_m114_and_wait(timeout=3.0)
+                if self.motion:
+                    self.motion.settle(position)
+                return position
 
             except Exception:
                 self._abort.clear()
+                if self.motion:
+                    self.motion.settle(self.last_position)
                 return self.last_position
 
     def emergency_stop(self):
@@ -411,6 +436,8 @@ class Printer:
         self._write_raw(gcode.emergency_stop())
         self.last_position = None
         self.homed = False
+        if self.motion:
+            self.motion.reset()
 
     # -------------------------------------------------
     # Limites de sécurité
@@ -477,6 +504,9 @@ class Printer:
 
             self._abort.clear()
 
+            if self.motion:
+                self.motion.reset()
+
             responses = self._send_command_locked(
                 gcode.home(axes),
                 timeout=config.HOME_TIMEOUT
@@ -485,7 +515,10 @@ class Printer:
             if not axes:
                 self.homed = True
 
-            self._refresh_position_locked(wait_for_moves=True)
+            position = self._refresh_position_locked(wait_for_moves=True)
+
+            if self.motion:
+                self.motion.reset(position)
 
             return responses
 
@@ -496,9 +529,15 @@ class Printer:
         timeout = config.MOVE_TIMEOUT if timeout is None else timeout
         # Une seule synchronisation de mouvement : aucun M114 pendant le trajet.
         self._send_command_locked(gcode.wait_for_moves(), timeout=timeout)
+        # M400 a répondu : le mouvement est terminé à CET instant.
+        if self.motion:
+            self.motion.finish()
         if self._abort.is_set():
             raise PrinterError("Commande interrompue.")
-        return self._refresh_position_locked(wait_for_moves=False)
+        position = self._refresh_position_locked(wait_for_moves=False)
+        if self.motion:
+            self.motion.settle(position)
+        return position
 
     # -------------------------------------------------
     # Déplacement relatif
@@ -517,6 +556,7 @@ class Printer:
             self._abort.clear()
 
             target = None
+            p0 = dict(self.last_position) if self.last_position else None
             if self.last_position is not None:
                 target = self.last_position[axis] + distance
                 self.check_target({axis: target})
@@ -527,6 +567,8 @@ class Printer:
 
             try:
                 responses += self._send_command_locked(commands[1])
+                if self.motion and p0 and target is not None:
+                    self.motion.start(p0, {axis: target}, speed or config.DEFAULT_SPEED)
             finally:
                 # Ne jamais rester en mode relatif.
                 try:
@@ -538,10 +580,15 @@ class Printer:
                     pass
 
             if wait:
-                if target is not None:
-                    self._wait_for_target_locked({axis: target})
-                else:
-                    self._refresh_position_locked(wait_for_moves=True)
+                try:
+                    if target is not None:
+                        self._wait_for_target_locked({axis: target})
+                    else:
+                        self._refresh_position_locked(wait_for_moves=True)
+                except Exception:
+                    if self.motion:
+                        self.motion.abort()
+                    raise
 
             return responses
 
@@ -562,12 +609,22 @@ class Printer:
             self._abort.clear()
 
             responses = []
+            p0 = dict(self.last_position) if self.last_position else None
 
             for command in commands:
                 responses += self._send_command_locked(command)
 
+            # Le déplacement est maintenant dans la file du firmware.
+            if self.motion and p0:
+                self.motion.start(p0, {"X": x, "Y": y, "Z": z}, speed or config.DEFAULT_SPEED)
+
             if wait:
-                self._wait_for_target_locked({"X": x, "Y": y, "Z": z})
+                try:
+                    self._wait_for_target_locked({"X": x, "Y": y, "Z": z})
+                except Exception:
+                    if self.motion:
+                        self.motion.abort()
+                    raise
 
             return responses
 
@@ -589,3 +646,17 @@ class Printer:
     def firmware_info(self):
 
         return self.send_command(gcode.firmware_info())
+
+    def read_motion_settings(self):
+        """Limites de vitesse / accélération du firmware (M503).
+
+        Retourne {"max_speed": {...}, "max_accel": {...}, "print_accel": ...}
+        ou {} si le firmware ne les fournit pas.
+        """
+
+        try:
+            lines = self.send_command("M503", timeout=10)
+        except (PrinterError, TimeoutError):
+            return {}
+
+        return motion.parse_m503(lines)

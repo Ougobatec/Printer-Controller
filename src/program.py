@@ -12,6 +12,14 @@ class ProgramError(Exception):
     """Programme invalide ou fichier illisible."""
 
 
+# Façons d'exécuter un programme :
+#  POINTS   : chaque position a sa vitesse et sa mesure (aucune, point, continu, trajet)
+#  PARCOURS : une vitesse et une fréquence de mesure globales pour tout le programme
+POINTS = "points"
+PARCOURS = "parcours"
+MEASURE_MODES = ("aucune", "point", "continu", "trajet")
+
+
 # -------------------------------------------------
 # Position
 # -------------------------------------------------
@@ -45,6 +53,10 @@ class Waypoint:
     z: Optional[float] = None
     vitesse: Optional[float] = None
     attente: float = 0.0
+    mesure: str = "aucune"
+    mesure_n: int = 5
+    mesure_duree: float = 2.0
+    mesure_frequence: float = 10.0
 
     def __post_init__(self):
 
@@ -53,6 +65,20 @@ class Waypoint:
         self.z = _number(self.z, "z")
         self.vitesse = _number(self.vitesse, "vitesse")
         self.attente = _number(self.attente or 0.0, "attente", False)
+        self.mesure = str(self.mesure or "aucune").lower()
+        if self.mesure not in MEASURE_MODES:
+            raise ProgramError("Le mode de mesure doit être « aucune », « point », "
+                               "« continu » ou « trajet ».")
+        try:
+            self.mesure_n = max(1, int(self.mesure_n))
+        except (TypeError, ValueError):
+            raise ProgramError("Le nombre d'échantillons de mesure doit être un entier positif.") from None
+        self.mesure_duree = _number(self.mesure_duree or 0.0, "durée de mesure", False)
+        self.mesure_frequence = _number(self.mesure_frequence or 0.0, "fréquence de mesure", False)
+        if self.mesure_duree < 0:
+            raise ProgramError("La durée de mesure ne peut pas être négative.")
+        if self.mesure_frequence <= 0:
+            raise ProgramError("La fréquence de mesure doit être strictement positive.")
 
         if self.vitesse is not None and self.vitesse <= 0:
             raise ProgramError("La vitesse doit être strictement positive.")
@@ -73,6 +99,15 @@ class Waypoint:
 
         if self.attente:
             data["attente"] = self.attente
+        if self.mesure != "aucune":
+            data["mesure"] = self.mesure
+            if self.mesure == "point":
+                data["mesure_n"] = self.mesure_n
+                data["mesure_frequence"] = self.mesure_frequence
+            else:
+                if self.mesure == "continu":
+                    data["mesure_duree"] = self.mesure_duree
+                data["mesure_frequence"] = self.mesure_frequence
 
         return data
 
@@ -87,7 +122,11 @@ class Waypoint:
             y=data.get("y"),
             z=data.get("z"),
             vitesse=data.get("vitesse"),
-            attente=data.get("attente", 0.0)
+            attente=data.get("attente", 0.0),
+            mesure=data.get("mesure", "aucune"),
+            mesure_n=data.get("mesure_n", 5),
+            mesure_duree=data.get("mesure_duree", 2.0),
+            mesure_frequence=data.get("mesure_frequence", config.ACQ_SAMPLE_RATE)
         )
 
 
@@ -101,6 +140,12 @@ class Program:
 
         self.name = name
         self.positions = list(positions or [])
+
+        # Mode « parcours » : réglages globaux
+        self.mode = PARCOURS
+        self.vitesse = float(config.DEFAULT_SPEED)       # mm/min
+        self.frequence = float(config.ACQ_SAMPLE_RATE)   # Hz
+        self.parcours_mesure = True
 
     def __len__(self):
         return len(self.positions)
@@ -151,6 +196,12 @@ class Program:
 
         problems = []
 
+        if self.mode == PARCOURS:
+            if not 0 < self.vitesse <= max_speed:
+                problems.append(f"Vitesse du parcours invalide (1 à {max_speed:g} mm/min).")
+            if self.parcours_mesure and not 0 < self.frequence <= config.ACQ_MAX_RATE:
+                problems.append(f"Fréquence de mesure invalide (0 à {config.ACQ_MAX_RATE:g} Hz).")
+
         if not self.positions:
             problems.append("Le programme ne contient aucune position.")
         elif not any(wp.x is not None or wp.y is not None or wp.z is not None for wp in self.positions):
@@ -181,14 +232,44 @@ class Program:
 
         return problems
 
+    # ---- estimation ---------------------------------------------------
+
+    def estimate(self, model, start=None):
+        """(durée en s, longueur en mm) estimées avec le modèle de mouvement."""
+
+        from motion import estimate_path
+
+        steps = []
+        for wp in self.positions:
+            feed = (wp.vitesse or self.vitesse) if self.mode == PARCOURS else wp.vitesse
+            steps.append((wp.x, wp.y, wp.z, feed, wp.attente))
+
+        return estimate_path(model, steps, start)
+
     # ---- JSON -----------------------------------------------------------
 
     def to_dict(self):
 
-        return {
-            "nom": self.name,
-            "positions": [wp.to_dict() for wp in self.positions]
-        }
+        data = {"nom": self.name, "mode": self.mode}
+
+        if self.mode == PARCOURS:
+            data["parcours"] = {
+                "vitesse": self.vitesse,
+                "mesure": self.parcours_mesure,
+                "frequence": self.frequence,
+            }
+
+        positions = []
+
+        for wp in self.positions:
+            item = wp.to_dict()
+            if self.mode == PARCOURS:
+                item["mesure_frequence"] = wp.mesure_frequence
+            positions.append(item)
+
+        data["positions"] = positions
+
+        return data
 
     @classmethod
     def from_dict(cls, data):
@@ -208,7 +289,21 @@ class Program:
             except ProgramError as e:
                 raise ProgramError(f"Position {i} : {e}") from None
 
-        return cls(str(data.get("nom", "Sans titre")), positions)
+        program = cls(str(data.get("nom", "Sans titre")), positions)
+
+        program.mode = POINTS
+
+        if data.get("mode") == PARCOURS:
+            program.mode = PARCOURS
+            settings = data.get("parcours") or {}
+            try:
+                program.vitesse = float(settings.get("vitesse", program.vitesse))
+                program.frequence = float(settings.get("frequence", program.frequence))
+            except (TypeError, ValueError):
+                raise ProgramError("Réglages du parcours invalides.") from None
+            program.parcours_mesure = bool(settings.get("mesure", True))
+
+        return program
 
     def save(self, path):
 
@@ -244,13 +339,17 @@ class ProgramRunner:
     """Exécute un programme sur une imprimante.
 
     `run()` est bloquant : l'appeler depuis un thread. Les callbacks
-    sont appelés depuis ce thread.
+    sont appelés depuis ce thread (ils peuvent donc bloquer).
 
+    on_begin(program)                   avant la première position
     on_step(index, waypoint)            avant le déplacement
-    on_reached(index, waypoint, pos)    arrivée (et attente) terminées ;
-                                        c'est ici que l'on déclenche une
-                                        mesure : le programme attend la
-                                        fin du callback.
+    before_move(index, waypoint, speed) juste avant l'envoi du déplacement
+    after_move(index, waypoint)         déplacement terminé (avant l'attente)
+    on_measure(index, waypoint, pos)    arrivée et attente terminées, mode
+                                        « point par point » : mesure à
+                                        l'arrivée ; le programme attend.
+    on_reached(index, waypoint, pos)    arrivée (et mesure) terminées
+    on_end(program, state)              fin, quelle que soit l'issue
     on_state(state, message)            changement d'état
     """
 
@@ -259,13 +358,23 @@ class ProgramRunner:
         printer,
         on_step=None,
         on_reached=None,
-        on_state=None
+        on_measure=None,
+        on_state=None,
+        on_begin=None,
+        on_end=None,
+        before_move=None,
+        after_move=None
     ):
 
         self.printer = printer
         self.on_step = on_step
         self.on_reached = on_reached
+        self.on_measure = on_measure
         self.on_state = on_state
+        self.on_begin = on_begin
+        self.on_end = on_end
+        self.before_move = before_move
+        self.after_move = after_move
 
         self.state = IDLE
         self.error = None
@@ -299,7 +408,13 @@ class ProgramRunner:
 
         self._set_state(RUNNING)
 
+        final = STOPPED
+        message = ""
+
         try:
+
+            if self.on_begin:
+                self.on_begin(program)
 
             for index in range(start_index, len(program)):
 
@@ -310,20 +425,29 @@ class ProgramRunner:
 
                 waypoint = program[index]
 
-                if waypoint.x is None and waypoint.y is None and waypoint.z is None:
-                    if self.on_step:
-                        self.on_step(index, waypoint)
-                    continue
-
                 if self.on_step:
                     self.on_step(index, waypoint)
+
+                if waypoint.x is None and waypoint.y is None and waypoint.z is None:
+                    continue
+
+                if program.mode == PARCOURS:
+                    speed = waypoint.vitesse or program.vitesse
+                else:
+                    speed = waypoint.vitesse
+
+                if self.before_move:
+                    self.before_move(index, waypoint, speed)
 
                 self.printer.move_absolute(
                     waypoint.x,
                     waypoint.y,
                     waypoint.z,
-                    waypoint.vitesse
+                    speed
                 )
+
+                if self.after_move:
+                    self.after_move(index, waypoint)
 
                 if waypoint.attente > 0:
                     if self._stop.wait(waypoint.attente):
@@ -334,26 +458,40 @@ class ProgramRunner:
 
                 position = self.printer.get_position()
 
+                if (
+                    self.on_measure
+                    and program.mode == POINTS
+                    and waypoint.mesure in ("point", "continu")
+                ):
+                    self.on_measure(index, waypoint, position)
+
                 if self.on_reached:
                     self.on_reached(index, waypoint, position)
 
             else:
-                self._set_state(FINISHED)
-                return FINISHED
+                final = FINISHED
 
         except Exception as e:
 
             if self._stop.is_set():
                 # Arrêt demandé : l'erreur vient de l'interruption.
-                self._set_state(STOPPED)
-                return STOPPED
+                final = STOPPED
+            else:
+                final = ERROR
+                message = str(e) or e.__class__.__name__
+                self.error = message
 
-            self.error = str(e) or e.__class__.__name__
-            self._set_state(ERROR, self.error)
-            return ERROR
+        try:
+            if self.on_end:
+                self.on_end(program, final)
+        except Exception as e:
+            if final != ERROR:
+                final = ERROR
+                message = str(e) or e.__class__.__name__
+                self.error = message
 
-        self._set_state(STOPPED)
-        return STOPPED
+        self._set_state(final, message)
+        return final
 
     def pause(self):
         """Met en pause après le déplacement en cours."""

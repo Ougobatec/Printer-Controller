@@ -1,3 +1,34 @@
+# Lancement rapide (environnement virtuel)
+
+Windows : double-clic sur `start.bat`  (ou `start.bat --port COM3`).
+Linux / macOS : `./start.sh`  (Tkinter requis : `sudo apt install python3-tk`).
+
+Ces scripts créent `.venv`, installent `requirements.txt` puis lancent `run.py`.
+À la main : `python -m venv .venv`, activer l'environnement, `pip install -r requirements.txt`,
+`python run.py`.
+
+# Nouveautés de l'interface
+
+Cette version remplace l'ancien panneau de mesure par une interface en trois colonnes
+(console redimensionnable) et trois onglets :
+**Programme**, **Mesure**, **Résultats**.
+
+- **Recalibrage forcé** à chaque connexion (`FORCE_HOMING` dans `config.py`) : aucun déplacement
+  tant que G28 n'est pas fait. Le bouton « Aller au début » remplace l'ancien « Revenir au départ ».
+- **Système de mesure interchangeable** (`devices.py`) : NI-DAQmx ou instrument série. Chaque
+  pilote déclare ses réglages (`Param`) et l'interface génère le formulaire. Pour ajouter un
+  système : une classe `AcquisitionDevice` + `@register`.
+- **Multiplicateur et unité** (défaut ×1000, V) : valeur affichée = valeur brute × multiplicateur.
+- **Deux modes de programme** : « Point par point » (vitesse et mesure propres à chaque position :
+  aucune, point, continu, trajet) ou « Parcours » (une vitesse et une fréquence globales).
+- **Coordonnées des mesures calculées** (`motion.py`) : instant, fréquence, vitesse, accélération
+  et limites par axe (Z bridé). Elles sont lues sur le firmware (M503) au recalibrage et
+  modifiables dans « Profil de mouvement… ». La tête bouge aussi en temps réel dans le schéma.
+- **Résultats** : tableau complet avec coordonnées, courbes valeur/temps ou valeur/position,
+  nuage 3D coloré, export CSV.
+- Les réglages (colonnes, système de mesure, unité, profil de mouvement) sont mémorisés dans
+  `settings.json`. Le module `matplotlib` n'est plus nécessaire.
+
 # Ender Controller
 
 Programme Python pour contrôler une imprimante **Creality Ender-3** par USB et, à terme, synchroniser son déplacement avec un système d'acquisition de mesures.
@@ -430,3 +461,41 @@ Position :         X1      X2      X3
 ```
 
 L'objectif final est donc d'obtenir un système de **positionnement XYZ piloté par Python**, auquel différents systèmes de mesure peuvent être connectés sans modifier le fonctionnement fondamental de l'imprimante.
+
+## Mesure intégrée
+
+L'application peut maintenant piloter un appareil de mesure réel NI-DAQ via `nidaqmx`.
+
+### Connexion
+
+Dans le panneau **Mesure**, sélectionner la carte NI et la voie analogique puis cliquer sur **Connecter**.
+Le pilote NI-DAQmx et le module Python `nidaqmx` doivent être installés sur le PC.
+
+### Acquisition temps réel
+
+- fréquence configurable en Hz ;
+- graphe temps réel ;
+- valeur instantanée ;
+- minimum, maximum, moyenne et écart-type ;
+- effacement et export CSV ;
+- axe horizontal au choix : temps, X, Y, Z ou point de programme.
+
+### Mesure dans un programme
+
+Chaque point peut être configuré avec :
+
+- **aucune** : aucun relevé ;
+- **point** : moyenne d'un nombre défini d'échantillons à l'arrivée du point ;
+- **continu** : acquisition pendant une durée et à une fréquence définies après l'arrivée du point.
+
+Ces paramètres sont sauvegardés dans le JSON du programme.
+
+## Organisation de l'interface
+
+L'interface est organisée en trois colonnes fixes sous la barre supérieure :
+
+- gauche : contrôle direct de l'imprimante (position, jog, vitesse, recalibrage) ;
+- centre : onglets **Programme** et **Mesure** ;
+- droite : représentation 3D et édition du point sélectionné.
+
+Les colonnes gauche/droite et l'onglet Mesure disposent de leur propre défilement vertical. Le tableau du programme possède également son propre défilement. La molette de la vue 3D reste réservée au zoom et la console conserve son défilement indépendant.

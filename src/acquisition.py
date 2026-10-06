@@ -1,440 +1,353 @@
-"""Acquisition de mesures.
+"""Moteur d'acquisition : flux direct, enregistrement, export.
 
-Ce module ne dépend PAS de l'imprimante : la position éventuelle est
-fournie par une fonction `position_provider` qui retourne
-{"X":.., "Y":.., "Z":..} ou None. Le système de mesure peut ainsi être
-remplacé ou supprimé sans toucher au contrôle de l'Ender.
+Principe :
+
+* un seul flux de lecture tourne dans un thread (« contrôle en direct ») ;
+* tout ce qui est lu alimente un petit tampon `live` (pour vérifier que le
+  capteur fonctionne) ;
+* quand un SEGMENT est ouvert (`begin_segment`), les lectures sont en plus
+  ENREGISTRÉES dans les résultats avec leur horodatage et leur position ;
+* la position vient de `position_provider(t)` (le suivi de trajectoire de
+  `motion.py`) : aucune interrogation de l'imprimante pendant la mesure.
+  Quand un déplacement se termine, les positions estimées sont recalculées
+  (`refine_positions`) avec sa durée réelle.
+
+Valeur enregistrée = valeur brute de l'appareil × `multiplier`, exprimée
+dans `unit`.
 """
 
 import csv
 import math
-import random
-import statistics
 import threading
 import time
-from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 import config
+from devices import AcquisitionDevice, AcquisitionError, DEVICE_TYPES, device_class  # noqa: F401
 
-
-class AcquisitionError(Exception):
-    """Erreur du système de mesure."""
-
-
-# -------------------------------------------------
-# Mesure
-# -------------------------------------------------
 
 @dataclass
 class Measurement:
-    timestamp: float                 # secondes (époque Unix)
-    value: float
+    timestamp: float
+    value: float                       # valeur convertie (× multiplicateur)
     unit: str = "V"
-    kind: str = "point"              # "point" ou "continu"
-    index: Optional[int] = None      # numéro de la position du programme
+    kind: str = "continu"              # "continu" (échantillon) | "point" (moyenne)
+    mode: str = "libre"                # point | continu | trajet | parcours
+    index: Optional[int] = None        # n° de position du programme (0 = première)
     x: Optional[float] = None
     y: Optional[float] = None
     z: Optional[float] = None
-    n: int = 1                       # nombre d'échantillons moyennés
-    std: Optional[float] = None      # écart-type de ces échantillons
+    estimated: bool = False            # position calculée (tête en mouvement)
+    n: int = 1
+    std: Optional[float] = None
+    vmin: Optional[float] = None
+    vmax: Optional[float] = None
+    raw: Optional[float] = None        # valeur brute de l'appareil
 
 
-# -------------------------------------------------
-# Périphériques
-# -------------------------------------------------
+def describe_values(values):
+    """Statistiques d'une liste de valeurs : dict(n, min, max, mean, std)."""
+    n = len(values)
+    if not n:
+        return None
+    mean = math.fsum(values) / n
+    var = math.fsum((v - mean) ** 2 for v in values) / n
+    return {"n": n, "min": min(values), "max": max(values), "mean": mean, "std": math.sqrt(var)}
 
-class AcquisitionDevice(ABC):
-    """Un instrument capable de renvoyer une valeur."""
-
-    unit = "V"
-    label = "Instrument"
-
-    def open(self):
-        pass
-
-    def close(self):
-        pass
-
-    @abstractmethod
-    def read(self):
-        """Retourne une valeur (float)."""
-
-
-class SimulatedDevice(AcquisitionDevice):
-    """Signal factice : dépend de X si une position est connue."""
-
-    label = "Simulation"
-
-    def __init__(self, position_provider=None, noise=0.01):
-
-        self.position_provider = position_provider
-        self.noise = noise
-        self._t0 = time.monotonic()
-
-    def read(self):
-
-        position = self.position_provider() if self.position_provider else None
-
-        if position:
-            phase = position["X"] / 20.0 + position["Y"] / 50.0
-        else:
-            phase = (time.monotonic() - self._t0) / 2.0
-
-        return 1.0 + 0.5 * math.sin(phase) + random.gauss(0.0, self.noise)
-
-
-class NIDAQDevice(AcquisitionDevice):
-    """Entrée analogique d'une carte NI (ex. USB-6001) via nidaqmx."""
-
-    label = "NI DAQ"
-
-    def __init__(
-        self,
-        device=None,
-        channel=None,
-        voltage_range=None
-    ):
-
-        self.device = device or config.DAQ_DEVICE
-        self.channel = channel or config.DAQ_CHANNEL
-        self.voltage_range = voltage_range or config.DAQ_VOLTAGE_RANGE
-        self._task = None
-
-    def open(self):
-
-        if self._task is not None:
-            return
-
-        try:
-            import nidaqmx
-        except ImportError:
-            raise AcquisitionError(
-                "Le module « nidaqmx » est absent "
-                "(pip install nidaqmx) ou le pilote NI-DAQmx "
-                "n'est pas installé."
-            ) from None
-
-        low, high = self.voltage_range
-
-        task = nidaqmx.Task()
-
-        try:
-            task.ai_channels.add_ai_voltage_chan(
-                f"{self.device}/{self.channel}",
-                min_val=low,
-                max_val=high
-            )
-        except Exception as e:
-            task.close()
-            raise AcquisitionError(
-                f"Voie {self.device}/{self.channel} inaccessible : {e}"
-            ) from None
-
-        self._task = task
-
-    def close(self):
-
-        if self._task is not None:
-            self._task.close()
-            self._task = None
-
-    def read(self):
-
-        if self._task is None:
-            self.open()
-
-        return float(self._task.read())
-
-
-def list_nidaq_devices():
-    """Noms des cartes NI détectées (liste vide si nidaqmx absent)."""
-
-    try:
-        from nidaqmx.system import System
-        return [d.name for d in System.local().devices]
-    except Exception:
-        return []
-
-
-def create_device(backend=None, position_provider=None, **options):
-    """Crée un périphérique : backend "simulation" ou "nidaq"."""
-
-    backend = (backend or config.ACQ_BACKEND).lower()
-
-    if backend == "simulation":
-        return SimulatedDevice(position_provider)
-
-    if backend == "nidaq":
-        return NIDAQDevice(**options)
-
-    raise AcquisitionError(f"Système de mesure inconnu : {backend!r}")
-
-
-# -------------------------------------------------
-# Acquisition
-# -------------------------------------------------
 
 class Acquisition:
-    """Mesures ponctuelles et acquisition continue, dans un thread dédié."""
+    LIVE_SECONDS = 120
 
-    def __init__(
-        self,
-        device,
-        sample_rate=None,
-        average_samples=None,
-        position_provider=None,
-        max_samples=None
-    ):
-
-        self.device = device
-        self.sample_rate = sample_rate or config.ACQ_SAMPLE_RATE
-        self.average_samples = average_samples or config.ACQ_AVERAGE_SAMPLES
+    def __init__(self, position_provider=None):
+        self.device = None
+        self.sample_rate = float(config.ACQ_SAMPLE_RATE)
+        self.multiplier = float(config.MEASURE_MULTIPLIER)
+        self.unit = str(config.MEASURE_UNIT)
+        self.average_samples = int(config.ACQ_AVERAGE_SAMPLES)
         self.position_provider = position_provider
-
-        self.latest = None
+        self.on_error = None
         self.last_error = None
 
-        # Appelé depuis le thread d'acquisition en cas d'erreur.
-        self.on_error = None
+        self.latest = None             # (horodatage, valeur) de la dernière lecture
+        self.revision = 0              # +1 à chaque changement des résultats
+        self.trim_epoch = 0            # +1 quand des anciennes lignes sont supprimées
 
-        self._samples = deque(maxlen=max_samples or config.ACQ_MAX_SAMPLES)
-        self._points = []
+        self._records = []
+        self._live = deque(maxlen=int(config.ACQ_MAX_RATE * self.LIVE_SECONDS))
         self._data_lock = threading.Lock()
-
-        # Un seul accès à la fois à l'instrument.
         self._device_lock = threading.Lock()
-        self._opened = False
-
         self._thread = None
         self._stop = threading.Event()
+        self._recording = False
+        self._rate_override = None
+        self._seg = None
+        self.current_index = None
+        self.current_mode = "libre"
 
-        self.t0 = time.time()
-
-    # ---- lecture ----------------------------------------------------
-
-    def _read_once(self):
-
-        with self._device_lock:
-
-            if not self._opened:
-                self.device.open()
-                self._opened = True
-
-            return self.device.read()
-
-    def _position(self):
-
-        if not self.position_provider:
-            return None, None, None
-
-        position = self.position_provider()
-
-        if not position:
-            return None, None, None
-
-        return position.get("X"), position.get("Y"), position.get("Z")
-
-    def measure(self, index=None, n=None):
-        """Mesure ponctuelle : moyenne de `n` échantillons.
-
-        Bloquant. La position est lue à la fin de la mesure.
-        """
-
-        n = max(1, int(n or self.average_samples))
-        interval = 1.0 / self.sample_rate
-
-        values = []
-
-        for i in range(n):
-
-            values.append(self._read_once())
-
-            if i < n - 1:
-                time.sleep(interval)
-
-        x, y, z = self._position()
-
-        measurement = Measurement(
-            timestamp=time.time(),
-            value=statistics.fmean(values),
-            unit=self.device.unit,
-            kind="point",
-            index=index,
-            x=x, y=y, z=z,
-            n=n,
-            std=statistics.pstdev(values) if n > 1 else None
-        )
-
-        with self._data_lock:
-            self._points.append(measurement)
-
-        self.latest = measurement
-
-        return measurement
-
-    # ---- acquisition continue --------------------------------------
+    # ------------------------------------------------------------------
+    # Connexion
+    # ------------------------------------------------------------------
+    @property
+    def connected(self):
+        return self.device is not None
 
     @property
-    def is_running(self):
+    def description(self):
+        return self.device.describe() if self.device else ""
 
-        return self._thread is not None and self._thread.is_alive()
+    def connect(self, device):
+        """Ouvre l'appareil (bloquant : à appeler depuis un thread)."""
+        self.disconnect()
+        with self._device_lock:
+            device.open()
+            self.device = device
+        self.last_error = None
+
+    def disconnect(self):
+        self.end_segment()
+        self.stop()
+        with self._device_lock:
+            device, self.device = self.device, None
+        if device is not None:
+            try:
+                device.close()
+            except Exception:
+                pass
+
+    def _read_raw(self):
+        with self._device_lock:
+            device = self.device
+            if device is None:
+                raise AcquisitionError("Aucun appareil de mesure connecté.")
+            return float(device.read())
+
+    def _position(self, timestamp):
+        provider = self.position_provider
+        pos = provider(timestamp) if provider else None
+        if not pos:
+            return None, None, None, False
+        return pos.get("X"), pos.get("Y"), pos.get("Z"), bool(pos.get("estimated"))
+
+    # ------------------------------------------------------------------
+    # Flux de lecture
+    # ------------------------------------------------------------------
+    @property
+    def is_running(self):
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def start(self):
-
         if self.is_running:
             return
-
-        self.last_error = None
+        if not self.connected:
+            raise AcquisitionError("Aucun appareil de mesure connecté.")
         self._stop.clear()
-
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
-
         self._stop.set()
-
-        if self._thread is not None:
-            self._thread.join(timeout=3)
-
-        self._thread = None
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(3.0)
 
     def _loop(self):
-
-        period = 1.0 / self.sample_rate
         next_time = time.monotonic()
-
         while not self._stop.is_set():
-
             try:
-                value = self._read_once()
-            except Exception as e:
-
-                self.last_error = str(e) or e.__class__.__name__
-
-                if self.on_error:
-                    self.on_error(self.last_error)
-
+                raw = self._read_raw()
+            except Exception as exc:
+                self._fail(exc)
                 return
-
-            x, y, z = self._position()
-
-            measurement = Measurement(
-                timestamp=time.time(),
-                value=value,
-                unit=self.device.unit,
-                kind="continu",
-                x=x, y=y, z=z
-            )
-
+            ts = time.time()
+            value = raw * self.multiplier
             with self._data_lock:
-                self._samples.append(measurement)
-
-            self.latest = measurement
-
-            next_time += period
+                self._live.append((ts, value))
+                self.latest = (ts, value)
+                if self._recording:
+                    x, y, z, est = self._position(ts)
+                    self._records.append(Measurement(
+                        ts, value, self.unit, "continu", self.current_mode, self.current_index,
+                        x, y, z, est, raw=raw))
+                    self._trim_locked()
+                    self.revision += 1
+            rate = max(0.1, self._rate_override or self.sample_rate)
+            next_time += 1.0 / rate
             delay = next_time - time.monotonic()
-
             if delay > 0:
                 self._stop.wait(delay)
             else:
-                # En retard : on repart de maintenant.
-                next_time = time.monotonic()
+                next_time = time.monotonic()   # en retard : on ne rattrape pas
 
-    # ---- données ---------------------------------------------------
+    def _fail(self, exc):
+        message = str(exc) or exc.__class__.__name__
+        self.last_error = message
+        if self.on_error:
+            try:
+                self.on_error(message)
+            except Exception:
+                pass
 
-    def recent_values(self, count=200):
-        """Les `count` dernières valeurs continues (pour un affichage)."""
+    def _trim_locked(self):
+        limit = int(config.ACQ_MAX_SAMPLES)
+        if len(self._records) > limit:
+            del self._records[: len(self._records) - int(limit * 0.9)]
+            self.trim_epoch += 1
 
+    # ------------------------------------------------------------------
+    # Enregistrement lié au programme
+    # ------------------------------------------------------------------
+    @property
+    def in_segment(self):
+        return self._seg is not None
+
+    def begin_segment(self, index=None, mode="continu", rate=None):
+        """Commence à enregistrer. Le flux démarre seul s'il ne tourne pas."""
+        if not self.connected:
+            raise AcquisitionError("Aucun appareil de mesure connecté.")
+        auto = not self.is_running
         with self._data_lock:
-            return [m.value for m in list(self._samples)[-count:]]
+            self._seg = {"t0": time.time(), "auto": auto}
+            self.current_index = index
+            self.current_mode = mode
+            self._rate_override = rate
+            self._recording = True
+        if auto:
+            self.start()
+
+    def set_index(self, index):
+        self.current_index = index
+
+    def set_rate(self, rate):
+        """Change la fréquence de l'enregistrement en cours."""
+        self._rate_override = rate
+
+    def end_segment(self):
+        """Arrête l'enregistrement ; recalcule les positions du segment."""
+        seg = self._seg
+        if seg is None:
+            return
+        with self._data_lock:
+            self._recording = False
+            self._rate_override = None
+            self._seg = None
+        if seg["auto"]:
+            self.stop()
+        self.current_index = None
+        self.current_mode = "libre"
+        self.refine_positions(seg["t0"])
+
+    def refine_positions(self, since):
+        """Recalcule les positions des échantillons depuis `since`.
+
+        Appelé quand un déplacement est terminé : sa durée réelle est alors
+        connue, ce qui corrige l'estimation faite en direct.
+        """
+        provider = self.position_provider
+        if provider is None:
+            return
+        with self._data_lock:
+            for m in reversed(self._records):
+                if m.timestamp < since:
+                    break
+                if m.kind != "continu":
+                    continue
+                pos = provider(m.timestamp)
+                if pos:
+                    m.x, m.y, m.z = pos.get("X"), pos.get("Y"), pos.get("Z")
+                    m.estimated = bool(pos.get("estimated"))
+            self.revision += 1
+
+    def measure(self, index=None, n=None, mode="point", cancel=None, rate=None):
+        """Moyenne de `n` lectures, enregistrée comme UN résultat."""
+        n = max(1, int(n or self.average_samples))
+        raws = []
+        for i in range(n):
+            if cancel is not None and cancel.is_set():
+                return None
+            raws.append(self._read_raw())
+            if i < n - 1:
+                wait = 1.0 / max(0.1, rate or self.sample_rate)
+                if cancel is not None:
+                    if cancel.wait(wait):
+                        return None
+                else:
+                    time.sleep(wait)
+        values = [r * self.multiplier for r in raws]
+        stats = describe_values(values)
+        ts = time.time()
+        x, y, z, est = self._position(ts)
+        m = Measurement(ts, stats["mean"], self.unit, "point", mode, index, x, y, z, est,
+                        n, stats["std"] if n > 1 else None, stats["min"], stats["max"],
+                        raw=math.fsum(raws) / n)
+        with self._data_lock:
+            self._records.append(m)
+            self._trim_locked()
+            self.revision += 1
+        return m
+
+    # ------------------------------------------------------------------
+    # Accès aux données
+    # ------------------------------------------------------------------
+    def live_since(self, t):
+        out = []
+        with self._data_lock:
+            for item in reversed(self._live):
+                if item[0] < t:
+                    break
+                out.append(item)
+        out.reverse()
+        return out
+
+    def records_snapshot(self):
+        with self._data_lock:
+            return list(self._records)
 
     @property
-    def count(self):
-        """Nombre total de mesures conservées."""
-
-        with self._data_lock:
-            return len(self._samples) + len(self._points)
-
-    @property
-    def points(self):
-
-        with self._data_lock:
-            return list(self._points)
-
-    @property
-    def records(self):
-        """Toutes les mesures (ponctuelles et continues) dans l'ordre du temps."""
-
-        with self._data_lock:
-            data = list(self._points) + list(self._samples)
-
-        return sorted(data, key=lambda m: m.timestamp)
+    def record_count(self):
+        return len(self._records)
 
     def clear(self):
-
         with self._data_lock:
-            self._samples.clear()
-            self._points.clear()
+            self._records.clear()
+            self.trim_epoch += 1
+            self.revision += 1
 
-        self.latest = None
-        self.t0 = time.time()
+    def clear_live(self):
+        with self._data_lock:
+            self._live.clear()
+            self.latest = None
 
-    def close(self):
-        """Arrête l'acquisition et libère l'instrument."""
-
-        self.stop()
-
-        with self._device_lock:
-
-            if self._opened:
-                self.device.close()
-                self._opened = False
-
-    # ---- export ----------------------------------------------------
-
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
     def export_csv(self, path):
-        """Écrit toutes les mesures dans un fichier CSV. Retourne leur nombre."""
+        """Écrit toutes les mesures avec leurs coordonnées. Retourne le nombre de lignes."""
+        rows = self.records_snapshot()
+        if not rows:
+            return 0
 
-        records = self.records
-
-        def fmt(value, digits=6):
-
+        def num(value, digits=9):
             if value is None:
                 return ""
-
             text = f"{value:.{digits}g}"
+            return text.replace(".", config.CSV_DECIMAL) if config.CSV_DECIMAL != "." else text
 
-            return text.replace(".", config.CSV_DECIMAL)
-
+        t0 = rows[0].timestamp
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-
             writer = csv.writer(f, delimiter=config.CSV_DELIMITER)
-
-            writer.writerow([
-                "temps_s", "horodatage", "type", "position",
-                "x_mm", "y_mm", "z_mm",
-                "valeur", "unite", "n", "ecart_type"
-            ])
-
-            for m in records:
-
+            writer.writerow(["n", "temps_s", "horodatage", "type", "mode", "point",
+                             "x_mm", "y_mm", "z_mm", "position_calculee",
+                             "valeur", "unite", "brut", "n_moyenne", "ecart_type", "min", "max"])
+            for i, m in enumerate(rows, start=1):
                 writer.writerow([
-                    fmt(m.timestamp - self.t0, 9),
-                    datetime.fromtimestamp(m.timestamp).isoformat(
-                        sep=" ", timespec="milliseconds"
-                    ),
-                    m.kind,
+                    i, num(m.timestamp - t0, 7),
+                    datetime.fromtimestamp(m.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    "moyenne" if m.kind == "point" else "echantillon", m.mode,
                     "" if m.index is None else m.index + 1,
-                    fmt(m.x, 7), fmt(m.y, 7), fmt(m.z, 7),
-                    fmt(m.value, 9),
-                    m.unit,
-                    m.n,
-                    fmt(m.std, 6)
-                ])
-
-        return len(records)
+                    num(m.x, 7), num(m.y, 7), num(m.z, 7), "oui" if m.estimated else "non",
+                    num(m.value), m.unit, num(m.raw), m.n, num(m.std), num(m.vmin), num(m.vmax)])
+        return len(rows)

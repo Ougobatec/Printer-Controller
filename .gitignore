@@ -34,3 +34,6 @@ programs/*.json
 
 # Mesures exportées
 mesures_*.csv
+
+# Réglages mémorisés par l interface
+settings.json

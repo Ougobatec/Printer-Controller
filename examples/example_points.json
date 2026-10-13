@@ -1,0 +1,190 @@
+{
+  "version": 2,
+  "name": "Example - points with measurements",
+  "points": [
+    {
+      "x": 20.0,
+      "y": 20.0,
+      "z": 20.0,
+      "speed": 600.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "average",
+        "by": "count",
+        "rate_hz": 10.0,
+        "count": 5
+      }
+    },
+    {
+      "x": 80.0,
+      "y": 20.0,
+      "z": 20.0,
+      "speed": 1200.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 140.0,
+      "y": 20.0,
+      "z": 20.0,
+      "speed": 1200.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 140.0,
+      "y": 70.0,
+      "z": 20.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "average",
+        "by": "count",
+        "rate_hz": 10.0,
+        "count": 5
+      }
+    },
+    {
+      "x": 80.0,
+      "y": 70.0,
+      "z": 20.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 20.0,
+      "y": 70.0,
+      "z": 20.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 20.0,
+      "y": 120.0,
+      "z": 40.0,
+      "speed": 800.0,
+      "pause": 0.7,
+      "measure": {
+        "kind": "average",
+        "by": "count",
+        "rate_hz": 10.0,
+        "count": 5
+      }
+    },
+    {
+      "x": 80.0,
+      "y": 120.0,
+      "z": 40.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "average",
+        "by": "duration",
+        "rate_hz": 10.0,
+        "duration_s": 2.0
+      }
+    },
+    {
+      "x": 140.0,
+      "y": 120.0,
+      "z": 40.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 140.0,
+      "y": 70.0,
+      "z": 60.0,
+      "speed": 800.0,
+      "pause": 0.7,
+      "measure": {
+        "kind": "average",
+        "by": "count",
+        "rate_hz": 10.0,
+        "count": 5
+      }
+    },
+    {
+      "x": 80.0,
+      "y": 70.0,
+      "z": 60.0,
+      "speed": 800.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "average",
+        "by": "duration",
+        "rate_hz": 10.0,
+        "duration_s": 2.0
+      }
+    },
+    {
+      "x": 20.0,
+      "y": 70.0,
+      "z": 60.0,
+      "speed": 800.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 20.0,
+      "y": 20.0,
+      "z": 40.0,
+      "speed": 800.0,
+      "pause": 0.7,
+      "measure": {
+        "kind": "average",
+        "by": "count",
+        "rate_hz": 10.0,
+        "count": 5
+      }
+    },
+    {
+      "x": 80.0,
+      "y": 20.0,
+      "z": 40.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 140.0,
+      "y": 20.0,
+      "z": 40.0,
+      "speed": 1000.0,
+      "pause": 0.5,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 80.0,
+      "y": 70.0,
+      "z": 80.0,
+      "speed": 600.0,
+      "pause": 1.0,
+      "measure": {
+        "kind": "average",
+        "by": "count",
+        "rate_hz": 10.0,
+        "count": 5
+      }
+    }
+  ]
+}

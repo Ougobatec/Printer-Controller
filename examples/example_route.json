@@ -1,0 +1,55 @@
+{
+  "version": 2,
+  "name": "Example - route",
+  "points": [
+    {
+      "x": 20.0,
+      "y": 20.0,
+      "z": 10.0,
+      "speed": 600.0,
+      "pause": 0.0,
+      "measure": {
+        "kind": "none"
+      }
+    },
+    {
+      "x": 120.0,
+      "y": 20.0,
+      "z": 10.0,
+      "speed": 600.0,
+      "pause": 0.0,
+      "measure": {
+        "kind": "path",
+        "by": "rate",
+        "rate_hz": 20.0,
+        "duration_s": 2.0
+      }
+    },
+    {
+      "x": 120.0,
+      "y": 60.0,
+      "z": 10.0,
+      "speed": 600.0,
+      "pause": 1.0,
+      "measure": {
+        "kind": "path",
+        "by": "rate",
+        "rate_hz": 20.0,
+        "duration_s": 2.0
+      }
+    },
+    {
+      "x": 20.0,
+      "y": 60.0,
+      "z": 10.0,
+      "speed": 600.0,
+      "pause": 0.0,
+      "measure": {
+        "kind": "path",
+        "by": "rate",
+        "rate_hz": 20.0,
+        "duration_s": 2.0
+      }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printer-controller"
+version = "0.1.0"
+description = "Control a G-code (Marlin) printer, run measurement programs and view the results."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyserial>=3.5",
+    "openpyxl>=3.1",      # Excel export
+    "matplotlib>=3.7",    # PNG export of the graphs
+]
+
+[project.optional-dependencies]
+nidaq = ["nidaqmx>=1.0"]  # NI-DAQ cards (also needs the NI-DAQmx driver installed on the PC)
+dev = ["pytest>=7"]
+
+[project.scripts]
+printer-controller = "printer_controller.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+printer_controller = ["locales/*.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

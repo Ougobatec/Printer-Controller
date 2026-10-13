@@ -17,15 +17,13 @@ from printer_controller.settings import Settings
 
 
 def test_measure_sample_counts():
-    assert Measure(AVERAGE, DURATION, duration_s=2, rate_hz=10).samples() == (20, 10)
-    assert Measure(AVERAGE, COUNT, count=7, rate_hz=10).samples() == (7, 10)
-    assert Measure(AVERAGE, DURATION, duration_s=2, rate_hz=1000).samples(max_rate=100) == (2000, 100)
+    assert Measure(AVERAGE, DURATION, duration_s=2).samples(program_rate=10) == (20, 10)
+    assert Measure(AVERAGE, COUNT, count=7).samples(program_rate=10) == (7, 10)
+    assert Measure(AVERAGE, DURATION, duration_s=2).samples(max_rate=100, program_rate=1000) == (2000, 100)
     assert Measure(SIMPLE).samples() == (1, 10.0) and Measure(NONE).samples()[0] == 0
-    count, rate = Measure(PATH, COUNT, count=10).samples(move_duration=2.0)
-    assert (count, rate) == (10, 5.0)                       # 10 readings spread over a 2 s move
-    count, rate = Measure(PATH, RATE, rate_hz=10).samples(move_duration=2.0)
-    assert (count, rate) == (21, 10)
-    assert Measure(AVERAGE, COUNT, count=5, rate_hz=10).duration() == 0.5
+    count, rate = Measure(PATH).samples(move_duration=2.0, program_rate=1000)
+    assert (count, rate) == (2001, 1000)                  # path count is derived from the global rate
+    assert Measure(AVERAGE, COUNT, count=5).duration(program_rate=10) == 0.5
 
 
 def test_first_point_cannot_be_a_path():
@@ -37,15 +35,15 @@ def test_first_point_cannot_be_a_path():
 def test_validate():
     limits = {"X": (0, 100), "Y": (0, 100), "Z": (0, 100)}
     program = Program("p", [Point(500, 0, 0, speed=300), Point(10, 10, 10, speed=99999),
-                            Point(1, 1, 1, measure=Measure(AVERAGE, rate_hz=5000))])
+                            Point(1, 1, 1, measure=Measure(AVERAGE))])
     codes = [code for code, _ in program.validate(limits, 6000, 1000)]
-    assert codes == ["out_of_limits", "speed", "rate"]
+    assert codes == ["out_of_limits", "speed"]  # per-point acquisition rates are no longer validated/used
     assert [c for c, _ in Program("e", []).validate(limits, 6000, 1000)] == ["empty"]
 
 
 def test_estimate_includes_moves_pauses_and_measures():
     profile = PrinterProfile()
-    program = Program("p", [Point(0, 0, 0), Point(100, 0, 0, speed=3000, pause=2.0, measure=Measure(AVERAGE, COUNT, count=10, rate_hz=10))])
+    program = Program("p", [Point(0, 0, 0), Point(100, 0, 0, speed=3000, pause=2.0, measure=Measure(AVERAGE, COUNT, count=10))])
     seconds, length = program.estimate(profile)
     assert length == pytest.approx(100.0)
     assert 2.0 + 1.0 + 2.0 < seconds < 8.0                  # ~2 s of move + 2 s pause + 1 s of average
@@ -54,13 +52,14 @@ def test_estimate_includes_moves_pauses_and_measures():
 def test_json_round_trip(tmp_path):
     program = Program("test", [
         Point(0, 0, 0, 600, 0.5),
-        Point(10, None, 5, 300, 1.0, Measure(AVERAGE, DURATION, duration_s=3, rate_hz=20)),
-        Point(20, 20, 5, 900, 0.0, Measure(PATH, COUNT, count=12)),
+        Point(10, None, 5, 300, 1.0, Measure(AVERAGE, DURATION, duration_s=3)),
+        Point(20, 20, 5, 900, 0.0, Measure(PATH)),
         Point(30, 0, 0, 300, 0.0, Measure(SIMPLE))])
     path = tmp_path / "p.json"
     program_io.save(program, path)
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["version"] == 2 and data["points"][1]["measure"]["by"] == "duration"
+    assert data["points"][2]["measure"] == {"kind": PATH}  # no per-path count or frequency
     again = program_io.load(path)
     assert again == program
 
@@ -76,12 +75,12 @@ def test_legacy_files_are_converted():
     assert kinds == [SIMPLE, AVERAGE, AVERAGE, PATH] and program.name == "old"
     assert program.points[0].speed == 600 and program.points[2].pause == 1.5
     assert program.points[1].measure.by == COUNT and program.points[1].measure.count == 5
-    assert program.points[2].measure.by == DURATION and program.points[3].measure.rate_hz == 25
+    assert program.points[2].measure.by == DURATION and program.points[3].measure.kind == PATH
     route = {"nom": "r", "mode": "parcours", "parcours": {"vitesse": 450, "frequence": 15, "mesure": True},
              "positions": [{"x": 0, "y": 0, "z": 0}, {"x": 5, "y": 0, "z": 0}, {"x": 9, "y": 0, "z": 0}]}
     converted = program_io.from_dict(route)
     assert [p.measure.kind for p in converted.points] == [NONE, PATH, PATH]
-    assert converted.points[1].speed == 450 and converted.points[1].measure.rate_hz == 15
+    assert converted.points[1].speed == 450 and converted.points[1].measure.kind == PATH
 
 
 def test_bad_files(tmp_path):
@@ -151,8 +150,8 @@ def test_program_run_records_every_kind_of_measure(tmp_path):
     program = Program("t", [
         Point(10, 0, 0, 6000, 0.0, Measure(PATH)),                                   # first point: ignored
         Point(30, 0, 0, 6000, 0.1, Measure(SIMPLE)),
-        Point(30, 20, 0, 6000, 0.1, Measure(AVERAGE, COUNT, count=5, rate_hz=100)),
-        Point(60, 20, 0, 6000, 0.0, Measure(PATH, RATE, rate_hz=40))])
+        Point(30, 20, 0, 6000, 0.1, Measure(AVERAGE, COUNT, count=5)),
+        Point(60, 20, 0, 6000, 0.0, Measure(PATH))])
     program.normalize()
     runner.start(program)
     assert wait_for(runner, (FINISHED, ERROR, STOPPED)) == FINISHED

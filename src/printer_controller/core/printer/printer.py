@@ -116,9 +116,10 @@ class Printer:
         plan = plan_move(self.profile, start, target, speed)
         if plan is None:
             return None
+        submitted_at = __import__("time").monotonic()
         self.connection.send(gcode.move(*(target[a] for a in gcode.AXES), speed),
                              timeout=self.settings.printer.command_timeout)
-        self.tracker.queue(plan)
+        self.tracker.queue(plan, submitted_at=submitted_at)
         return plan
 
     def move_to(self, x=None, y=None, z=None, speed=300.0, wait=True):

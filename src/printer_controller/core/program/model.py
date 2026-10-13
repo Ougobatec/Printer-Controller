@@ -8,39 +8,34 @@ from ..printer.motion import plan_move
 NONE, SIMPLE, AVERAGE, PATH = "none", "simple", "average", "path"
 KINDS = (NONE, SIMPLE, AVERAGE, PATH)
 DURATION, COUNT, RATE = "duration", "count", "rate"      # how an average / a path is defined
-BY = {AVERAGE: (DURATION, COUNT), PATH: (RATE, COUNT)}
+BY = {AVERAGE: (DURATION, COUNT), PATH: ()}
 
 
 @dataclass
 class Measure:
     kind: str = NONE
-    by: str = DURATION            # average: duration | count ; path: rate | count
+    by: str = DURATION            # average: duration | count; PATH uses the program-wide frequency
     duration_s: float = 2.0       # average defined by a duration
-    count: int = 5                # average or path defined by a number of measurements
-    rate_hz: float = 10.0         # frequency of the measurements
+    count: int = 5                # number of readings for a point average
 
-    def samples(self, move_duration=0.0, max_rate=None):
-        """(number of readings, frequency in Hz) for this measurement.
-
-        For a path, `move_duration` is the estimated duration of the move."""
-        rate = self.rate_hz
+    def samples(self, move_duration=0.0, max_rate=None, program_rate=10.0):
+        """(number of readings, frequency in Hz), using the single program-wide rate."""
+        rate = float(program_rate)
         if self.kind == AVERAGE:
             count = self.count if self.by == COUNT else max(1, round(self.duration_s * rate))
         elif self.kind == PATH:
-            if self.by == COUNT:
-                count = self.count
-                rate = count / move_duration if move_duration > 0 else self.rate_hz
-            else:
-                count = max(1, int(move_duration * rate) + 1)
+            # A path is sampled at the program-wide rate, never by a per-path count.
+            rate = min(rate, max_rate) if max_rate else rate
+            count = max(1, int(max(0.0, move_duration) * rate) + 1)
         else:
             return (1, rate) if self.kind == SIMPLE else (0, rate)
         return count, min(rate, max_rate) if max_rate else rate
 
-    def duration(self, move_duration=0.0):
+    def duration(self, move_duration=0.0, program_rate=10.0):
         """Time spent measuring at the point (an average only; a path happens during the move)."""
         if self.kind != AVERAGE:
             return 0.0
-        count, rate = self.samples()
+        count, rate = self.samples(program_rate=program_rate)
         return self.duration_s if self.by == DURATION else count / rate
 
 
@@ -94,17 +89,15 @@ class Program:
             if p.pause < 0:
                 issues.append(("pause", {"line": i}))
             m = p.measure
-            if m.kind in (AVERAGE, PATH):
-                if m.rate_hz <= 0 or (max_rate and m.rate_hz > max_rate):
-                    issues.append(("rate", {"line": i, "rate": m.rate_hz, "limit": max_rate}))
-                if m.count < 1 or m.duration_s <= 0:
+            if m.kind == AVERAGE:
+                if (m.by == COUNT and m.count < 1) or (m.by == DURATION and m.duration_s <= 0):
                     issues.append(("measure", {"line": i}))
             if m.kind == PATH and i == 1:
                 issues.append(("path_first", {"line": i}))
         return issues
 
-    def estimate(self, profile, start=None):
-        """(duration in s, path length in mm) of the whole program, from the motion model."""
+    def estimate(self, profile, start=None, acquisition_rate=10.0):
+        """(duration in s, path length in mm), using one acquisition rate for the whole program."""
         position = dict(start or {a: 0.0 for a in gcode.AXES})
         seconds = length = 0.0
         for p in self.points:
@@ -114,6 +107,6 @@ class Program:
             if plan:
                 seconds += plan.duration
                 length += plan.length
-            seconds += p.pause + p.measure.duration()
+            seconds += p.pause + p.measure.duration(program_rate=acquisition_rate)
             position = target
         return seconds, length

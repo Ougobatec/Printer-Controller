@@ -86,7 +86,7 @@ class ProgramForm(tk.Frame):
             self.note.set(t("form.note.none"))
             for var in self.vars.values():
                 var.set("")
-            self.measure.set_values("", "", "", "", "")
+            self.measure.set_values("", "", "", "")
         else:
             self.title.set(t("form.line", n=rows[0] + 1) if len(chosen) == 1 else t("form.lines", n=len(chosen)))
             self.note.set(t("form.note.one") if len(chosen) == 1 else t("form.note.many"))
@@ -100,8 +100,7 @@ class ProgramForm(tk.Frame):
             self.measure.allow_path(len(chosen) > 1 or rows[0] > 0)
             m = lambda get: common(lambda p: get(p.measure))                       # noqa: E731
             kind, by = m(lambda x: x.kind) or "", m(lambda x: x.by) or ""
-            self.measure.set_values(kind, by, number(m(lambda x: x.count)), number(m(lambda x: x.duration_s)),
-                                    number(m(lambda x: x.rate_hz)))
+            self.measure.set_values(kind, by, number(m(lambda x: x.count)), number(m(lambda x: x.duration_s)))
         self._loaded = self._snapshot()
 
     def reload(self):

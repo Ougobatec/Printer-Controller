@@ -106,7 +106,7 @@ class ProgramRunner:
             plan = printer.move_to(point.x, point.y, point.z, point.speed, wait=not along)
             if along:
                 if plan is not None:
-                    self.recorder.path(measure, plan.duration, printer.position, self._cancel)
+                    self.recorder.path(measure, plan.duration, lambda when=None: printer.tracker.position(when), self._cancel)
                     self._checkpoint()
                 printer.wait_moves()
         self._sleep(point.pause)

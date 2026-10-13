@@ -60,7 +60,7 @@ class SensorSettings:
 class ProgramSettings:
     speed: float = 300.0                 # mm/min : default of every new line
     pause: float = 0.0                   # s
-    rate_hz: float = 10.0
+    rate_hz: float = 1000.0
     duration_s: float = 2.0
     count: int = 5
     folder: str = field(default_factory=lambda: os.path.join(_data_dir(), "programs"))

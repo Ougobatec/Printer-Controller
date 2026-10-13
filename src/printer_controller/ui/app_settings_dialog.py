@@ -10,7 +10,6 @@ from .theme import C
 FIELDS = (
     ("program", "program.speed", "float", "mm/min", "speed"),
     ("program", "program.pause", "float0", "s", None),
-    ("program", "program.rate_hz", "float", "Hz", "rate"),
     ("program", "program.duration_s", "float", "s", None),
     ("program", "program.count", "int", "", None),
     ("program", "program.folder", "dir", "", None),

@@ -50,6 +50,23 @@ class ProgramTab(tk.Frame):
             ttk.Button(files, text=text, style="Soft.TButton", command=command).grid(
                 row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
 
+        # One visible, program-wide acquisition frequency (not a per-point option).
+        rate_row = tk.Frame(pad, bg=C["surface"])
+        rate_row.pack(fill="x", pady=(10, 0))
+        tk.Label(rate_row, text=t("program.rate.label"), bg=C["surface"], fg=C["text"],
+                 font=fonts["small"]).pack(side="left")
+        self.rate_var = tk.StringVar(value=f"{self.app.settings.program.rate_hz:g}")
+        self.rate_entry = ttk.Entry(rate_row, textvariable=self.rate_var, width=9)
+        self.rate_entry.pack(side="left", padx=(8, 4))
+        tk.Label(rate_row, text="Hz", bg=C["surface"], fg=C["muted"], font=fonts["small"]).pack(side="left")
+        self.rate_save_button = ttk.Button(rate_row, text=t("settings.save"), style="Soft.TButton",
+                                           command=self._save_program_rate)
+        self.rate_save_button.pack(side="left", padx=(8, 0))
+        tk.Label(pad, text=t("program.rate.note"), bg=C["surface"], fg=C["muted"],
+                 font=fonts["small"], anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(3, 0))
+        self.rate_entry.bind("<Return>", lambda _e: self._save_program_rate())
+        self.rate_entry.bind("<FocusOut>", lambda _e: self._save_program_rate())
+
         # --- run controls -------------------------------------------------------------------------------------
         run = tk.Frame(pad, bg=C["surface"])
         run.pack(fill="x", pady=(12, 0))
@@ -93,9 +110,33 @@ class ProgramTab(tk.Frame):
         self.refresh()
         self.set_run_state(IDLE, None)
 
+    def _save_program_rate(self):
+        """Persist the single acquisition frequency shared by every point in this program."""
+        if self.state in (RUNNING, PAUSED):
+            self.rate_var.set(f"{self.app.settings.program.rate_hz:g}")
+            return
+        try:
+            rate = float(self.rate_var.get().strip().replace(",", "."))
+            if rate <= 0:
+                raise ValueError
+            max_rate = self.app.acquisition.max_rate
+            if max_rate and rate > max_rate:
+                raise ValueError(f"La fréquence dépasse la limite de l'appareil ({max_rate:g} Hz).")
+        except ValueError as exc:
+            messagebox.showwarning(t("program.title"), str(exc) or "La fréquence doit être un nombre positif.",
+                                   parent=self.winfo_toplevel())
+            self.rate_var.set(f"{self.app.settings.program.rate_hz:g}")
+            return
+        self.app.settings.set("program.rate_hz", rate)
+        self.app.settings.save()
+        self.rate_var.set(f"{rate:g}")
+        self._update_estimate()
+
     # --- showing the program ----------------------------------------------------------------------------------------------
     def refresh(self, keep=None):
         self.name_var.set(self.program.name)
+        if not self.rate_entry.focus_get():
+            self.rate_var.set(f"{self.app.settings.program.rate_hz:g}")
         self.program.normalize()
         self.table.refresh(self.program.points, keep, self.step if self.state in (RUNNING, PAUSED) else None)
         self.form.load(self.program.points, self.table.selected_rows())
@@ -108,7 +149,7 @@ class ProgramTab(tk.Frame):
 
     def _update_estimate(self):
         if self.program.points:
-            seconds, length = self.program.estimate(self.app.printer.profile)
+            seconds, length = self.program.estimate(self.app.printer.profile, acquisition_rate=self.app.settings.program.rate_hz)
             self.estimate_var.set(t("run.estimate", time=format_duration(seconds), length=length))
         else:
             self.estimate_var.set("")
@@ -117,7 +158,7 @@ class ProgramTab(tk.Frame):
     def new_point(self, x=None, y=None, z=None):
         """A line with the default values of the settings (speed, frequency, duration, number)."""
         d = self.app.settings.program
-        return Point(x, y, z, d.speed, d.pause, Measure(rate_hz=d.rate_hz, duration_s=d.duration_s, count=d.count))
+        return Point(x, y, z, d.speed, d.pause, Measure(duration_s=d.duration_s, count=d.count))
 
     def add_point(self, x=None, y=None, z=None):
         """Add a line and tick it, ready to be edited in the form."""
@@ -170,7 +211,7 @@ class ProgramTab(tk.Frame):
         editor.pack(fill="x")
         m = point.measure
         editor.allow_path(index > 0)
-        editor.set_values(m.kind, m.by, f"{m.count:g}", f"{m.duration_s:g}", f"{m.rate_hz:g}")
+        editor.set_values(m.kind, m.by, f"{m.count:g}", f"{m.duration_s:g}")
         loaded = editor.snapshot()
 
         def ok():
@@ -242,10 +283,14 @@ class ProgramTab(tk.Frame):
 
     # --- running --------------------------------------------------------------------------------------------------------------------------
     def issues(self):
-        """Problems of the program as translated text lines."""
+        """Problems of the program as translated text lines, including global acquisition settings."""
         printer = self.app.printer
         found = self.program.validate(printer.profile.limits(), printer.effective_speed(1e9),
                                       self.app.acquisition.max_rate or None)
+        rate = float(self.app.settings.program.rate_hz)
+        max_rate = self.app.acquisition.max_rate
+        if rate <= 0 or (max_rate and rate > max_rate):
+            found.append(("program_rate", {"rate": rate, "max": max_rate or "?"}))
         return [t(f"issue.{code}", **details) for code, details in found]
 
     def _start(self):
@@ -265,6 +310,8 @@ class ProgramTab(tk.Frame):
         self.state, self.step = state, step
         total = len(self.program.points)
         running = state in (RUNNING, PAUSED)
+        self.rate_entry.configure(state="disabled" if running else "normal")
+        self.rate_save_button.configure(state="disabled" if running else "normal")
         if running:
             text = t(f"run.state.{state}", n=(step or 0) + 1, total=total)
         elif state == "error":

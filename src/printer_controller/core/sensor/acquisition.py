@@ -129,7 +129,20 @@ class Acquisition:
 
         `on_sample(wall_time, raw)` is called for each; returns the number taken (less if cancelled).
         """
-        period = 1.0 / self.effective_rate(rate)
+        rate = self.effective_rate(rate)
+        if rate <= 0:
+            raise SensorError("invalid acquisition rate")
+        # NI devices use their hardware sample clock and buffered block reads.
+        # Other sensors retain the best-effort software-timed loop below.
+        with self._lock:
+            sensor = self.sensor
+        if sensor is None:
+            raise SensorError("not connected")
+        timed = getattr(sensor, "sample_timed", None)
+        if callable(timed):
+            with self._lock:
+                return timed(rate, count, cancel, on_sample)
+        period = 1.0 / rate
         start = self._clock()
         taken = 0
         for i in range(count):

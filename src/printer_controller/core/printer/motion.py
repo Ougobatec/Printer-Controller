@@ -84,10 +84,10 @@ class PositionTracker:
         with self._lock:
             self._base, self._plans, self._kind = dict(position), [], VERIFIED
 
-    def queue(self, plan):
-        """Register a move just sent. Returns (t_start, t_end) on the tracker clock."""
+    def queue(self, plan, submitted_at=None):
+        """Register a move sent to Marlin. submitted_at is captured just before serial send."""
         with self._lock:
-            now = self._clock()
+            now = self._clock() if submitted_at is None else submitted_at
             t0 = max(now, self._plans[-1][1]) if self._plans else now
             self._plans.append((t0, t0 + plan.duration, plan))
             self._kind = COMPUTED

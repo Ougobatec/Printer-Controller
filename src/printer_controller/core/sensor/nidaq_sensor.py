@@ -119,6 +119,75 @@ class NidaqSensor(Sensor):
         except Exception as exc:
             raise SensorError(str(exc)) from None
 
+    def sample_timed(self, rate, count, cancel=None, on_sample=None, block_size=100):
+        """Acquire a finite sequence using NI's hardware sample clock.
+
+        Reads buffered blocks so Python scheduling does not set the sample cadence.
+        Timestamps are reconstructed from the monotonic task-start estimate; they are
+        not hardware timestamps and must not be treated as proof of sub-millisecond
+        synchronization with printer motion.
+        """
+        if self._task is None:
+            raise SensorError("not connected")
+        if rate <= 0 or count < 0:
+            raise SensorError("invalid acquisition rate or sample count")
+        if count == 0:
+            return 0
+        nidaqmx = _nidaqmx()
+        from nidaqmx.constants import AcquisitionType
+        task = self._task
+        taken = 0
+        try:
+            # Configure a finite, hardware-clocked acquisition for this measurement.
+            task.timing.cfg_samp_clk_timing(rate=float(rate), sample_mode=AcquisitionType.FINITE,
+                                            samps_per_chan=int(count))
+            task.start()
+            import time as _time
+            start_mono = _time.monotonic()
+            start_wall = _time.time()
+            samples = []
+            while taken < count:
+                if cancel is not None and cancel.is_set():
+                    break
+                n = min(int(block_size), count - taken)
+                values = task.read(number_of_samples_per_channel=n,
+                                   timeout=max(self.timeout_s, n / float(rate) + 2.0))
+                if not isinstance(values, list):
+                    values = [values]
+                # nidaqmx returns a flat list for one analog channel.
+                for value in values:
+                    if cancel is not None and cancel.is_set():
+                        break
+                    samples.append(float(value))
+                    taken += 1
+            # Process callbacks only after reading the hardware buffer, so result storage
+            # or trajectory calculations cannot delay the next DAQ read.
+            if on_sample:
+                for index, value in enumerate(samples):
+                    if cancel is not None and cancel.is_set():
+                        break
+                    on_sample(start_wall + index / float(rate), value)
+            return taken
+        except Exception as exc:
+            raise SensorError(str(exc)) from None
+        finally:
+            try:
+                task.stop()
+            except Exception:
+                pass
+            # Recreate the task on the next operation rather than leaving finite timing
+            # configuration active for ordinary single-point reads.
+            try:
+                task.close()
+            except Exception:
+                pass
+            self._task = None
+            try:
+                self.open()
+            except SensorError:
+                # Preserve the original acquisition error if re-opening fails.
+                pass
+
     def info(self):
         d = self.device
         return {"device": d.label if d else self.config.device,

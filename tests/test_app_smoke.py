@@ -52,9 +52,12 @@ def test_connect_run_a_program_and_export(app, tmp_path):
     assert "G28 O" in [c for c in app.printer.connection._serial.commands]
     program = Program("smoke", [
         Point(10, 10, 5, 6000, 0.0, Measure(SIMPLE)),
-        Point(30, 10, 5, 6000, 0.0, Measure(AVERAGE, COUNT, count=4, rate_hz=100)),
-        Point(30, 30, 5, 6000, 0.0, Measure(PATH, RATE, rate_hz=30))])
+        Point(30, 10, 5, 6000, 0.0, Measure(AVERAGE, COUNT, count=4)),
+        Point(30, 30, 5, 6000, 0.0, Measure(PATH))])
     app.program_tab.program = program
+    # The fake sensor in this smoke test supports at most 200 Hz.
+    app.settings.set("program.rate_hz", 200.0)
+    app.program_tab.rate_var.set("200")
     app.program_tab.refresh(keep=[])
     assert app.program_tab.issues() == []
     app.program_tab._start()

@@ -2,7 +2,7 @@
 
 import json
 
-from .model import AVERAGE, COUNT, DURATION, KINDS, NONE, PATH, RATE, SIMPLE, Measure, Point, Program
+from .model import AVERAGE, COUNT, DURATION, KINDS, NONE, PATH, SIMPLE, Measure, Point, Program
 
 VERSION = 2
 
@@ -24,9 +24,10 @@ def point_to_dict(point):
     data["speed"], data["pause"] = point.speed, point.pause
     m = point.measure
     measure = {"kind": m.kind}
-    if m.kind in (AVERAGE, PATH):
-        measure["by"], measure["rate_hz"] = m.by, m.rate_hz
+    if m.kind == AVERAGE:
+        measure["by"] = m.by
         measure["count" if m.by == COUNT else "duration_s"] = m.count if m.by == COUNT else m.duration_s
+    # PATH deliberately stores no sample count or frequency; both are program-wide.
     data["measure"] = measure
     return data
 
@@ -39,10 +40,9 @@ def point_from_dict(data):
     if kind not in KINDS:
         raise ProgramFileError(f"unknown measurement kind: {kind!r}")
     default = Measure()
-    measure = Measure(kind=kind, by=m.get("by", DURATION if kind != PATH else RATE),
+    measure = Measure(kind=kind, by=(m.get("by", DURATION) if kind == AVERAGE else DURATION),
                       duration_s=_number(m.get("duration_s"), default.duration_s),
-                      count=int(_number(m.get("count"), default.count)),
-                      rate_hz=_number(m.get("rate_hz"), default.rate_hz))
+                      count=int(_number(m.get("count"), default.count)))
     return Point(x=_number(data.get("x")), y=_number(data.get("y")), z=_number(data.get("z")),
                  speed=_number(data.get("speed"), 300.0), pause=_number(data.get("pause"), 0.0), measure=measure)
 
@@ -74,19 +74,19 @@ def _convert_legacy(old):
     for i, p in enumerate(positions):
         if not isinstance(p, dict):
             raise ProgramFileError("point expected")
-        rate = _number(p.get("mesure_frequence"), _number((route or {}).get("frequence"), 10.0))
+        # Legacy files may contain per-point rates; they are intentionally ignored now.
         old_kind = p.get("mesure", "aucune")
         n = int(_number(p.get("mesure_n"), 5))
         if route is not None:
-            measure = {"kind": PATH, "by": RATE, "rate_hz": rate} if route.get("mesure", True) and i > 0 else {"kind": NONE}
+            measure = {"kind": PATH} if route.get("mesure", True) and i > 0 else {"kind": NONE}
         elif old_kind == "simple" or (old_kind == "point" and n == 1):
             measure = {"kind": SIMPLE}
         elif old_kind in ("point", "moyenne") and (old_kind == "point" or p.get("mesure_par") == "nombre"):
-            measure = {"kind": AVERAGE, "by": COUNT, "count": n, "rate_hz": rate}
+            measure = {"kind": AVERAGE, "by": COUNT, "count": n}
         elif old_kind in ("continu", "moyenne"):
-            measure = {"kind": AVERAGE, "by": DURATION, "duration_s": _number(p.get("mesure_duree"), 2.0), "rate_hz": rate}
+            measure = {"kind": AVERAGE, "by": DURATION, "duration_s": _number(p.get("mesure_duree"), 2.0)}
         elif old_kind == "trajet":
-            measure = {"kind": PATH, "by": RATE, "rate_hz": rate}
+            measure = {"kind": PATH}
         else:
             measure = {"kind": NONE}
         speed = p.get("vitesse", (route or {}).get("vitesse", 300.0))

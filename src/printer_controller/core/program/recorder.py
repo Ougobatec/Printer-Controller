@@ -24,7 +24,12 @@ class Recorder:
 
     def average(self, position, measure, cancel=None):
         """Several readings at a point; they form a group (statistics in the second table)."""
-        count, rate = measure.samples(max_rate=self.acq.max_rate)
+        # Sampling cadence is a program-wide setting, not a per-measure setting.
+        rate = min(float(self.settings.program.rate_hz), self.acq.max_rate) if self.acq.max_rate else float(self.settings.program.rate_hz)
+        if measure.by == "count":
+            count = measure.count
+        else:
+            count = max(1, round(measure.duration_s * rate))
         group = self.store.new_group()
         try:
             self.acq.sample(rate, count, cancel,
@@ -38,10 +43,24 @@ class Recorder:
 
         `position_now()` returns ({"X","Y","Z"}, kind) for the current instant.
         """
-        count, rate = measure.samples(move_duration, self.acq.max_rate)
+        # Use the single program-wide sampling frequency for every path measurement.
+        rate = float(self.settings.program.rate_hz)
+        if self.acq.max_rate:
+            rate = min(rate, self.acq.max_rate)
+        count = max(1, int(max(0.0, move_duration) * rate) + 1)
 
         def on_sample(t, raw):
-            position, _ = position_now()
+            # PositionTracker uses monotonic time, whereas result timestamps are wall time.
+            # Keep the mapping local to this sample stream to avoid querying the position
+            # at callback time (which can lag behind the analog sample).
+            elapsed = t - first_wall
+            try:
+                position, _ = position_now(first_mono + elapsed)
+            except TypeError:
+                # Backward compatibility for callers that provide a no-argument callback.
+                position, _ = position_now()
             self._record(t, raw, position, COMPUTED, PATH)
 
+        first_wall = time.time()
+        first_mono = time.monotonic()
         return self.acq.sample(rate, count, cancel, on_sample)

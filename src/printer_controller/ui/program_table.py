@@ -21,12 +21,11 @@ def measure_text(m):
     if m.kind == SIMPLE:
         return t("measure.label.simple")
     if m.kind == AVERAGE:
-        count, rate = m.samples()
         if m.by == DURATION:
-            return t("measure.label.average_duration", d=m.duration_s, r=m.rate_hz, n=count)
-        return t("measure.label.average_count", n=m.count, r=m.rate_hz, s=m.count / m.rate_hz if m.rate_hz else 0)
+            return t("measure.label.average_duration", d=m.duration_s)
+        return t("measure.label.average_count", n=m.count)
     if m.kind == PATH:
-        return t("measure.label.path_count", n=m.count) if m.by == COUNT else t("measure.label.path_rate", r=m.rate_hz)
+        return t("measure.label.path_global")
     return t("measure.label.none")
 
 
